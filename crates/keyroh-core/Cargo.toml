@@ -1,0 +1,25 @@
+[package]
+name = "keyroh-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iroh = "1.0.0"
+iroh-docs = "0.101.0"
+iroh-blobs = "0.103.0"
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.128"
+aes-gcm = "0.10.3"
+ring = "0.17.14"
+uuid = { version = "1.10.0", features = ["v4", "serde"] }
+tokio = { version = "1.52.3", features = ["full"] }
+anyhow = "1.0.102"
+chrono = "0.4.38"
+hex = "0.4.3"
+rand = "0.10.1"
+
+
+
+
+
