@@ -1,5 +1,7 @@
-
-
 [workspace]
 resolver = "2"
-members = ["crates/keyroh-cli","crates/keyroh-core"]
+members = ["crates/keyroh-cli", "crates/keyroh-core", "crates/keyroh-tui"]
+
+[workspace.dependencies]
+keyroh-core = { path = "crates/keyroh-core" }
+tokio = { version = "1.52.3", features = ["full"] }

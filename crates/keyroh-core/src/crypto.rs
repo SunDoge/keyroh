@@ -2,23 +2,15 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce
 };
-use ring::pbkdf2;
-use std::num::NonZeroU32;
+use argon2::Argon2;
 use rand::Rng;
 use anyhow::{anyhow, Result};
 
-const PBKDF2_ITERATIONS: u32 = 100_000;
-
-/// Derives a 32-byte key from a password and salt using PBKDF2-HMAC-SHA256.
+/// Derives a 32-byte key from a password and salt using Argon2id.
 pub fn derive_key(password: &str, salt: &[u8], out: &mut [u8; 32]) {
-    let iterations = NonZeroU32::new(PBKDF2_ITERATIONS).unwrap();
-    pbkdf2::derive(
-        pbkdf2::PBKDF2_HMAC_SHA256,
-        iterations,
-        salt,
-        password.as_bytes(),
-        out,
-    );
+    Argon2::default()
+        .hash_password_into(password.as_bytes(), salt, out)
+        .expect("Argon2 key derivation failed");
 }
 
 /// Encrypts data using AES-256-GCM.
