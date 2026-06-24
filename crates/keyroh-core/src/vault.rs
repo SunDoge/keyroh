@@ -33,15 +33,15 @@ pub struct LoginDetails {
 impl LoginDetails {
     pub fn get_totp_code(&self) -> Option<String> {
         let totp_secret = self.totp.as_ref()?;
-        
-        use totp_rs::{TOTP, Secret};
-        
+
+        use totp_rs::{Secret, TOTP};
+
         if totp_secret.starts_with("otpauth://") {
             if let Ok(totp) = TOTP::from_url(totp_secret) {
                 return totp.generate_current().ok();
             }
         }
-        
+
         let cleaned = totp_secret.replace(' ', "");
         let secret = Secret::Encoded(cleaned);
         if let Ok(bytes) = secret.to_bytes() {
@@ -57,7 +57,7 @@ impl LoginDetails {
                 return totp.generate_current().ok();
             }
         }
-        
+
         None
     }
 }
