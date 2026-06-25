@@ -70,6 +70,10 @@ impl Iroh {
         &self.docs
     }
 
+    pub fn endpoint(&self) -> &iroh::Endpoint {
+        self.router.endpoint()
+    }
+
     pub async fn shutdown(self) -> Result<()> {
         self.router.shutdown().await?;
         Ok(())

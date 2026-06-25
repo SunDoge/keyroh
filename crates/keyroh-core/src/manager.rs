@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
+use futures::stream::Stream;
+pub use iroh_docs::engine::LiveEvent;
 use iroh_docs::{Author, AuthorId, NamespaceId, NamespaceSecret};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -92,6 +94,29 @@ impl Drop for UnlockedState {
     fn drop(&mut self) {
         self.master_key.zeroize();
     }
+}
+
+/// Live P2P network and document status, collected for TUI display.
+#[derive(Debug, Clone, Default)]
+pub struct SyncInfo {
+    /// Local node public key (iroh EndpointId).
+    pub node_id: String,
+    /// Home relay URL, if connected.
+    pub relay_url: Option<String>,
+    /// UDP sockets currently bound by the iroh endpoint.
+    pub bound_sockets: Vec<String>,
+    /// Iroh-docs namespace (document) ID.
+    pub namespace_id: String,
+    /// Iroh-docs author ID for this device.
+    pub author_id: String,
+    /// Number of vault items currently loaded in memory.
+    pub item_count: usize,
+    /// Hex-encoded public keys of known sync peers (from iroh-docs replica).
+    pub sync_peers: Vec<String>,
+    /// Whether the vault has been initialised on disk.
+    pub is_initialized: bool,
+    /// Whether the vault is currently unlocked in memory.
+    pub is_unlocked: bool,
 }
 
 pub struct VaultManager {
@@ -709,6 +734,86 @@ impl VaultManager {
         std::fs::write(state_path, state_str)?;
 
         Ok(())
+    }
+
+    /// Returns live P2P network and document sync status for display in the TUI.
+    pub async fn get_sync_info(&self) -> SyncInfo {
+        let endpoint = self.iroh.endpoint();
+
+        // Node identity
+        let node_id = endpoint.id().to_string();
+
+        // Current endpoint address (relay + direct addrs)
+        let addr = endpoint.addr();
+        let relay_url = addr.relay_urls().next().map(|u| u.to_string());
+        let bound_sockets: Vec<String> = endpoint
+            .bound_sockets()
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+
+        // Vault / document state
+        let (namespace_id, author_id, item_count, sync_peers) =
+            if let Some(ref state) = self.unlocked {
+                let ns_id = state.namespace_id.to_string();
+                let auth_id = state.author_id.to_string();
+                let count = state.items.len();
+
+                // Query known sync peers from the iroh-docs replica
+                let peers = match self.iroh.docs().open(state.namespace_id).await {
+                    Ok(Some(doc)) => match doc.get_sync_peers().await {
+                        Ok(Some(peers)) => peers.iter().map(|p| hex::encode(p)).collect::<Vec<_>>(),
+                        _ => vec![],
+                    },
+                    _ => vec![],
+                };
+
+                (ns_id, auth_id, count, peers)
+            } else if self.is_initialized().unwrap_or(false) {
+                // Read namespace/author IDs from state.json even when locked
+                let state_path = self.base_dir.join("state.json");
+                if let Ok(s) = std::fs::read_to_string(&state_path) {
+                    if let Ok(st) = serde_json::from_str::<LocalState>(&s) {
+                        (st.namespace_id, st.author_id, 0, vec![])
+                    } else {
+                        ("N/A".into(), "N/A".into(), 0, vec![])
+                    }
+                } else {
+                    ("N/A".into(), "N/A".into(), 0, vec![])
+                }
+            } else {
+                ("N/A".into(), "N/A".into(), 0, vec![])
+            };
+
+        SyncInfo {
+            node_id,
+            relay_url,
+            bound_sockets,
+            namespace_id,
+            author_id,
+            item_count,
+            sync_peers,
+            is_initialized: self.is_initialized().unwrap_or(false),
+            is_unlocked: self.unlocked.is_some(),
+        }
+    }
+
+    /// Subscribe to live vault events from the iroh-docs sync layer.
+    ///
+    /// Returns a stream of [`LiveEvent`]s. Requires the vault to be unlocked.
+    pub async fn subscribe_events(
+        &self,
+    ) -> Result<impl Stream<Item = Result<LiveEvent>> + Send + Unpin + 'static> {
+        let namespace_id = self.get_unlocked()?.namespace_id;
+
+        let doc = self
+            .iroh
+            .docs()
+            .open(namespace_id)
+            .await?
+            .ok_or_else(|| anyhow!("Namespace not found for event subscription"))?;
+
+        doc.subscribe().await
     }
 
     /// Gracefully shuts down the iroh P2P stack.

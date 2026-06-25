@@ -1,10 +1,11 @@
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use futures::StreamExt;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use keyroh_core::manager::VaultManager;
 use keyroh_core::vault::{CustomField, VaultItem};
+use keyroh_core::{LiveEvent, SyncInfo};
 
 // ── Clipboard helpers ────────────────────────────────────────────────────────
 /// Copy text using an already-open Clipboard handle.
@@ -187,11 +189,14 @@ struct App {
     form: FormState,
     editing_item_id: Option<String>,
 
-    // Auto-refresh timer
-    last_refresh: Instant,
+    // Timer for live sync/network info refresh (on ShowKeys page)
+    last_sync_refresh: Instant,
 
     // Sync ticket cache
     sync_ticket: Option<String>,
+
+    // Cached live sync/network info (refreshed periodically on ShowKeys)
+    sync_info: SyncInfo,
 
     // TUI Sync Ticket import
     ticket_input: String,
@@ -245,8 +250,9 @@ impl App {
             show_password: false,
             form: FormState::new(),
             editing_item_id: None,
-            last_refresh: Instant::now(),
+            last_sync_refresh: Instant::now(),
             sync_ticket: None,
+            sync_info: SyncInfo::default(),
             ticket_input: String::new(),
             init_focus: InitFocus::Ticket,
             welcome_choice: WelcomeChoice::Create,
@@ -386,36 +392,85 @@ async fn main() -> Result<()> {
 
 async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     let tick_rate = Duration::from_millis(250);
-    let mut last_tick = Instant::now();
+    let mut crossterm_events = EventStream::new();
+
+    // Channel that receives LiveEvents forwarded from a background task.
+    // Capacity 64 is more than enough for bursts of sync events.
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<LiveEvent>(64);
+    let mut subscribed = false;
 
     loop {
         terminal.draw(|f| ui(f, app))?;
 
-        let timeout = tick_rate
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or_else(|| Duration::from_secs(0));
-
-        if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == event::KeyEventKind::Press {
-                    if handle_key_event(app, key).await? {
-                        return Ok(()); // Quit requested
+        // Subscribe to vault events the first time we land on Browse.
+        // The spawned task owns the stream and forwards events through the channel.
+        if app.state == AppState::Browse && !subscribed {
+            if let Ok(mut stream) = app.manager.subscribe_events().await {
+                let tx = ev_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(Ok(ev)) = stream.next().await {
+                        if tx.send(ev).await.is_err() {
+                            break; // TUI exited — drop the task
+                        }
                     }
-                }
+                });
+                subscribed = true;
             }
         }
 
-        // Periodic database refresh & ticks
-        if last_tick.elapsed() >= tick_rate {
-            last_tick = Instant::now();
+        tokio::select! {
+            // ── Terminal keyboard events ─────────────────────────────────────
+            maybe_event = crossterm_events.next() => {
+                match maybe_event {
+                    Some(Ok(Event::Key(key))) if key.kind == event::KeyEventKind::Press => {
+                        if handle_key_event(app, key).await? {
+                            return Ok(());
+                        }
+                    }
+                    Some(Err(e)) => return Err(e.into()),
+                    _ => {}
+                }
+            }
 
-            // Auto refresh from disk every 5 seconds if browse screen or keys screen is open
-            if (app.state == AppState::Browse || app.state == AppState::ShowKeys)
-                && app.last_refresh.elapsed() >= Duration::from_secs(5)
-            {
-                let _ = app.manager.refresh_items().await;
-                let _ = app.update_items_list();
-                app.last_refresh = Instant::now();
+            // ── iroh-docs vault events ────────────────────────────────────────
+            Some(ev) = ev_rx.recv() => {
+                match ev {
+                    // Any insert or blob-ready event → refresh the item list immediately
+                    LiveEvent::InsertLocal { .. }
+                    | LiveEvent::InsertRemote { .. }
+                    | LiveEvent::ContentReady { .. }
+                    | LiveEvent::PendingContentReady => {
+                        let _ = app.manager.refresh_items().await;
+                        let _ = app.update_items_list();
+                    }
+                    // Peer/sync events → update sync info panel if it's visible
+                    LiveEvent::NeighborUp(_)
+                    | LiveEvent::NeighborDown(_)
+                    | LiveEvent::SyncFinished(_) => {
+                        if app.state == AppState::ShowKeys {
+                            app.sync_info = app.manager.get_sync_info().await;
+                            app.last_sync_refresh = Instant::now();
+                        }
+                    }
+                }
+            }
+
+            // ── 250 ms tick: timers ──────────────────────────────────────────
+            _ = tokio::time::sleep(tick_rate) => {
+                // Refresh live network info every 2 s on the sync page
+                if app.state == AppState::ShowKeys
+                    && app.last_sync_refresh.elapsed() >= Duration::from_secs(2)
+                {
+                    app.sync_info = app.manager.get_sync_info().await;
+                    app.last_sync_refresh = Instant::now();
+                }
+
+                // Expire transient clipboard feedback
+                if let Some((_, shown_at)) = &app.clipboard_msg {
+                    if shown_at.elapsed() > Duration::from_secs(3) {
+                        app.clipboard_msg = None;
+                    }
+                }
             }
         }
     }
@@ -615,6 +670,10 @@ async fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
             } else {
                 match key.code {
                     KeyCode::Char('q') => return Ok(true),
+                    KeyCode::Char('r') => {
+                        let _ = app.manager.refresh_items().await;
+                        let _ = app.update_items_list();
+                    }
                     KeyCode::Char('/') => {
                         app.search_focused = true;
                     }
@@ -702,6 +761,8 @@ async fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
                     }
                     KeyCode::Char('s') => {
                         app.sync_ticket = app.manager.export_sync_ticket().await.ok();
+                        app.sync_info = app.manager.get_sync_info().await;
+                        app.last_sync_refresh = Instant::now();
                         app.state = AppState::ShowKeys;
                     }
                     // [y] Copy password of selected item to clipboard
@@ -823,12 +884,6 @@ async fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
             }
         }
     }
-    // Expire clipboard message after 3 seconds
-    if let Some((_, shown_at)) = &app.clipboard_msg {
-        if shown_at.elapsed() > Duration::from_secs(3) {
-            app.clipboard_msg = None;
-        }
-    }
     Ok(false)
 }
 
@@ -913,9 +968,9 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         }
         AppState::PasswordPrompt => " [Enter] Unlock  |  [Esc] Quit",
         AppState::Browse => {
-            " [/] Search  |  [j/k] Navigate  |  [a] Add  |  [e] Edit  |  [d] Delete  |  [f] Fav  |  [p] Secret  |  [y] Copy Pwd  |  [s] Sync  |  [q] Quit"
+            " [/] Search  |  [j/k] Nav  |  [a] Add  |  [e] Edit  |  [d] Del  |  [f] Fav  |  [p] Secret  |  [y] Copy Pwd  |  [r] Refresh  |  [s] Sync  |  [q] Quit"
         }
-        AppState::ShowKeys => " [y] Copy Ticket  |  [Esc/s/q] Back to Browse",
+        AppState::ShowKeys => " [y] Copy Sync Ticket  |  [Esc/s/q] Back  |  (refreshes every 2s)",
         AppState::AddForm | AppState::EditForm => {
             " [Tab/Shift-Tab] Switch Field  |  [Ctrl+Enter] Save  |  [Esc] Cancel"
         }
@@ -1400,22 +1455,155 @@ fn draw_form_screen(f: &mut ratatui::Frame, area: Rect, app: &App) {
 fn draw_keys_screen(f: &mut ratatui::Frame, area: Rect, app: &App) {
     use ratatui::widgets::BorderType;
 
-    let block = Block::default()
-        .title(" Keyroh Cryptographic Keys & Sync Status ")
+    let outer_block = Block::default()
+        .title(" Sync Status ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan));
 
+    let inner = outer_block.inner(area);
+    f.render_widget(outer_block, area);
+
+    // Three vertical sections: Network | Document | Ticket
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7), // Network status
+            Constraint::Length(6), // Document / vault status
+            Constraint::Min(5),    // Sync ticket
+        ])
+        .split(inner);
+
+    // ── Section 1: Network Status ─────────────────────────────────────────────
+    let info = &app.sync_info;
+
+    let relay_str = info.relay_url.as_deref().unwrap_or("not connected");
+    let relay_color = if info.relay_url.is_some() {
+        Color::Green
+    } else {
+        Color::DarkGray
+    };
+
+    let sockets_str = if info.bound_sockets.is_empty() {
+        "none".to_string()
+    } else {
+        info.bound_sockets.join(", ")
+    };
+
+    let mut net_lines = vec![
+        Line::from(vec![Span::styled(
+            " Network",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![
+            Span::styled("  Node ID:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&info.node_id, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Relay:     ", Style::default().fg(Color::DarkGray)),
+            Span::styled(relay_str, Style::default().fg(relay_color)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Sockets:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&sockets_str, Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    let peers_header = Line::from(vec![
+        Span::styled("  Peers:     ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{} known", info.sync_peers.len()),
+            Style::default().fg(if info.sync_peers.is_empty() {
+                Color::DarkGray
+            } else {
+                Color::Green
+            }),
+        ),
+    ]);
+    net_lines.push(peers_header);
+
+    // Show up to 2 peer IDs inline (truncated to 16 chars for readability)
+    for peer in info.sync_peers.iter().take(2) {
+        let short = if peer.len() > 20 {
+            format!("    {}…", &peer[..20])
+        } else {
+            format!("    {}", peer)
+        };
+        net_lines.push(Line::from(vec![Span::styled(
+            short,
+            Style::default().fg(Color::Yellow),
+        )]));
+    }
+    if info.sync_peers.len() > 2 {
+        net_lines.push(Line::from(vec![Span::styled(
+            format!("    … and {} more", info.sync_peers.len() - 2),
+            Style::default().fg(Color::DarkGray),
+        )]));
+    }
+
+    f.render_widget(
+        Paragraph::new(net_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
+        sections[0],
+    );
+
+    // ── Section 2: Document / Vault Status ───────────────────────────────────
+    let vault_status = if info.is_unlocked {
+        Span::styled("unlocked ✓", Style::default().fg(Color::Green))
+    } else if info.is_initialized {
+        Span::styled("locked", Style::default().fg(Color::Yellow))
+    } else {
+        Span::styled("not initialized", Style::default().fg(Color::Red))
+    };
+
+    let doc_lines = vec![
+        Line::from(vec![Span::styled(
+            " Vault",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![
+            Span::styled("  Status:    ", Style::default().fg(Color::DarkGray)),
+            vault_status,
+        ]),
+        Line::from(vec![
+            Span::styled("  Namespace: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&info.namespace_id, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Author:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&info.author_id, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Items:     ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                info.item_count.to_string(),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+    ];
+
+    f.render_widget(
+        Paragraph::new(doc_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
+        sections[1],
+    );
+
+    // ── Section 3: Sync Ticket ────────────────────────────────────────────────
     let ticket = app
         .sync_ticket
         .as_deref()
-        .unwrap_or("N/A (Vault Locked/Error)");
+        .unwrap_or("N/A — unlock vault and press [s] again");
 
-    let status = app.manager.get_status().unwrap_or_default();
-    let namespace_id = status["namespace_id"].as_str().unwrap_or("N/A");
-    let author_id = status["author_id"].as_str().unwrap_or("N/A");
-
-    // Build clipboard feedback line
     let cb_line = if let Some((ref msg, _)) = app.clipboard_msg {
         Line::from(vec![Span::styled(
             format!("  ✓ {}", msg),
@@ -1425,31 +1613,17 @@ fn draw_keys_screen(f: &mut ratatui::Frame, area: Rect, app: &App) {
         )])
     } else {
         Line::from(vec![Span::styled(
-            "  Press [y] to copy Sync Ticket to clipboard.",
+            "  [y] copy ticket  [!] keep secure — grants full vault access",
             Style::default().fg(Color::DarkGray),
         )])
     };
 
-    let text = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                "  Namespace ID (Public ID):  ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(namespace_id, Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  Author ID (Public ID):     ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(author_id, Style::default().fg(Color::White)),
-        ]),
-        Line::from(""),
+    let ticket_lines = vec![
         Line::from(vec![Span::styled(
-            "  Sync Ticket (Invitation):",
-            Style::default().fg(Color::DarkGray),
+            " Sync Ticket (share with another device)",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![Span::styled(
             ticket,
@@ -1457,14 +1631,18 @@ fn draw_keys_screen(f: &mut ratatui::Frame, area: Rect, app: &App) {
         )]),
         Line::from(""),
         cb_line,
-        Line::from(""),
-        Line::from("  [!] Keep this ticket secure — it grants full vault access."),
-        Line::from(""),
-        Line::from("  Press [Esc] or [s] to return to browsing."),
     ];
 
-    let para = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
-    f.render_widget(para, area);
+    f.render_widget(
+        Paragraph::new(ticket_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .wrap(Wrap { trim: false }),
+        sections[2],
+    );
 }
 
 fn draw_init_import_screen(f: &mut ratatui::Frame, area: Rect, app: &App) {

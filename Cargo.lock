@@ -2711,6 +2711,7 @@ dependencies = [
  "arboard",
  "chrono",
  "crossterm",
+ "futures",
  "keyroh-core",
  "ratatui",
  "rpassword",
