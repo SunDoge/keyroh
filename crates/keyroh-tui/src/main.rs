@@ -20,13 +20,42 @@ use std::time::{Duration, Instant};
 use keyroh_core::manager::VaultManager;
 use keyroh_core::vault::{CustomField, VaultItem};
 
+// ── Clipboard helpers ────────────────────────────────────────────────────────
+/// Copy text using an already-open Clipboard handle.
+/// Keeping the handle alive is essential on Linux: X11/Wayland expect the
+/// owner process to serve selection requests until another owner takes over.
+fn clipboard_copy(ctx: &mut arboard::Clipboard, text: &str) -> Result<()> {
+    ctx.set_text(text.to_owned())
+        .map_err(|e| anyhow!("Copy failed: {}", e))
+}
+
+/// Paste from an already-open Clipboard handle.
+fn clipboard_paste(ctx: &mut arboard::Clipboard) -> Result<String> {
+    ctx.get_text().map_err(|e| anyhow!("Paste failed: {}", e))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AppState {
+    Welcome, // Landing: choose create or sync
     PasswordPrompt,
-    NotInitialized,
+    NotInitialized,       // Create new vault – enter password
+    NotInitializedImport, // Sync existing – enter ticket + password
     Browse,
     AddForm,
     EditForm,
+    ShowKeys,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WelcomeChoice {
+    Create,
+    Sync,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InitFocus {
+    Ticket,
+    Password,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -114,7 +143,7 @@ impl FormState {
             (
                 login.username.clone().unwrap_or_default(),
                 login.password.clone().unwrap_or_default(),
-                login.uris.first().clone().cloned().unwrap_or_default(),
+                login.uris.first().cloned().unwrap_or_default(),
                 login.totp.clone().unwrap_or_default(),
             )
         } else {
@@ -143,6 +172,7 @@ struct App {
     manager: VaultManager,
     state: AppState,
     password_input: String,
+    #[allow(dead_code)]
     password_confirm: String,
     auth_error: Option<String>,
 
@@ -159,25 +189,47 @@ struct App {
 
     // Auto-refresh timer
     last_refresh: Instant,
+
+    // Sync ticket cache
+    sync_ticket: Option<String>,
+
+    // TUI Sync Ticket import
+    ticket_input: String,
+    init_focus: InitFocus,
+
+    // Welcome screen cursor
+    welcome_choice: WelcomeChoice,
+
+    // Transient clipboard feedback: (message, shown_at)
+    clipboard_msg: Option<(String, Instant)>,
+
+    // Persistent clipboard handle — must NOT be dropped while the app runs;
+    // on Linux the process must keep serving X11 selection requests.
+    clipboard: Option<arboard::Clipboard>,
 }
 
 fn get_vault_dir() -> PathBuf {
-    let mut path = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap());
-    path.push(".config");
-    path.push("keyroh");
-    path
+    if let Ok(d) = std::env::var("KEYROH_DATA_DIR") {
+        PathBuf::from(d)
+    } else {
+        let mut path = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::current_dir().unwrap());
+        path.push(".config");
+        path.push("keyroh");
+        path
+    }
 }
 
 impl App {
-    fn new() -> Result<Self> {
+    pub async fn new() -> Result<Self> {
         let vault_dir = get_vault_dir();
-        let manager = VaultManager::open(&vault_dir)?;
+        let manager = VaultManager::open(&vault_dir).await?;
+        // If not yet initialized, show the Welcome landing menu first
         let state = if manager.is_initialized()? {
             AppState::PasswordPrompt
         } else {
-            AppState::NotInitialized
+            AppState::Welcome
         };
 
         Ok(Self {
@@ -194,6 +246,15 @@ impl App {
             form: FormState::new(),
             editing_item_id: None,
             last_refresh: Instant::now(),
+            sync_ticket: None,
+            ticket_input: String::new(),
+            init_focus: InitFocus::Ticket,
+            welcome_choice: WelcomeChoice::Create,
+            clipboard_msg: None,
+            // Open the clipboard once and keep it alive for the full app lifetime.
+            // On Linux (X11 / Wayland) the clipboard owner must stay alive to
+            // serve selection requests from other processes.
+            clipboard: arboard::Clipboard::new().ok(),
         })
     }
 
@@ -300,21 +361,27 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app
-    let mut app = App::new()?;
+    let mut app = App::new().await?;
 
     // Main run loop
     let res = run_app(&mut terminal, &mut app).await;
 
-    // Restore terminal
+    // Restore terminal before shutdown so any error messages are visible
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    if let Err(err) = res {
+    if let Err(ref err) = res {
         eprintln!("\x1b[31mError running TUI: {}\x1b[0m", err);
     }
 
-    Ok(())
+    // Graceful shutdown: flush iroh docs/blobs, zero master key in memory.
+    // shutdown() consumes VaultManager by value; extract it from App first.
+    if let Err(e) = app.manager.shutdown().await {
+        eprintln!("\x1b[33mWarning: shutdown error: {}\x1b[0m", e);
+    }
+
+    res
 }
 
 async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
@@ -342,10 +409,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut Ap
         if last_tick.elapsed() >= tick_rate {
             last_tick = Instant::now();
 
-            // Auto refresh from disk every 5 seconds if browse screen is open
-            if app.state == AppState::Browse && app.last_refresh.elapsed() >= Duration::from_secs(5)
+            // Auto refresh from disk every 5 seconds if browse screen or keys screen is open
+            if (app.state == AppState::Browse || app.state == AppState::ShowKeys)
+                && app.last_refresh.elapsed() >= Duration::from_secs(5)
             {
-                let _ = app.manager.refresh_items();
+                let _ = app.manager.refresh_items().await;
                 let _ = app.update_items_list();
                 app.last_refresh = Instant::now();
             }
@@ -355,20 +423,50 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut Ap
 
 async fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
     match app.state {
+        // ── Welcome landing menu ────────────────────────────────────────────
+        AppState::Welcome => match key.code {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                app.welcome_choice = WelcomeChoice::Create;
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                app.welcome_choice = WelcomeChoice::Sync;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                app.welcome_choice = WelcomeChoice::Create;
+                app.auth_error = None;
+                app.password_input.clear();
+                app.state = AppState::NotInitialized;
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                app.welcome_choice = WelcomeChoice::Sync;
+                app.auth_error = None;
+                app.password_input.clear();
+                app.ticket_input.clear();
+                app.init_focus = InitFocus::Ticket;
+                app.state = AppState::NotInitializedImport;
+            }
+            KeyCode::Enter => match app.welcome_choice {
+                WelcomeChoice::Create => {
+                    app.auth_error = None;
+                    app.password_input.clear();
+                    app.state = AppState::NotInitialized;
+                }
+                WelcomeChoice::Sync => {
+                    app.auth_error = None;
+                    app.password_input.clear();
+                    app.ticket_input.clear();
+                    app.init_focus = InitFocus::Ticket;
+                    app.state = AppState::NotInitializedImport;
+                }
+            },
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(true),
+            _ => {}
+        },
+        // ── Create new vault: enter master password ─────────────────────────
         AppState::NotInitialized => {
-            // Typing to initialize password
             match key.code {
                 KeyCode::Char(c) => {
-                    if app.password_input.is_empty() {
-                        // Enter master password
-                        app.password_input.push(c);
-                    } else if app.password_confirm.len() < app.password_input.len()
-                        || app.password_confirm.is_empty()
-                    {
-                        // If we are inputting confirm (state transition by Enter)
-                        // Actually let's use a simpler prompt state or split inputs
-                        app.password_input.push(c);
-                    }
+                    app.password_input.push(c);
                 }
                 KeyCode::Backspace => {
                     app.password_input.pop();
@@ -377,13 +475,99 @@ async fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
                     if app.password_input.len() < 8 {
                         app.auth_error = Some("Password must be at least 8 characters".into());
                     } else {
-                        app.manager.init(&app.password_input)?;
+                        app.manager.init(&app.password_input).await?;
                         app.password_input.clear();
                         app.auth_error = None;
                         app.state = AppState::PasswordPrompt;
                     }
                 }
-                KeyCode::Esc => return Ok(true), // Quit
+                KeyCode::Esc => {
+                    // Go back to Welcome menu
+                    app.password_input.clear();
+                    app.auth_error = None;
+                    app.state = AppState::Welcome;
+                }
+                _ => {}
+            }
+        }
+        // ── Sync existing vault: enter ticket + password ────────────────────
+        AppState::NotInitializedImport => {
+            match key.code {
+                KeyCode::Tab => {
+                    app.init_focus = match app.init_focus {
+                        InitFocus::Ticket => InitFocus::Password,
+                        InitFocus::Password => InitFocus::Ticket,
+                    };
+                }
+                KeyCode::BackTab => {
+                    app.init_focus = match app.init_focus {
+                        InitFocus::Ticket => InitFocus::Password,
+                        InitFocus::Password => InitFocus::Ticket,
+                    };
+                }
+                // Ctrl+V must come before the general Char(c) arm
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Ctrl+V: paste clipboard into focused field
+                    let result = app
+                        .clipboard
+                        .as_mut()
+                        .map(clipboard_paste)
+                        .unwrap_or_else(|| Err(anyhow!("Clipboard unavailable")));
+                    match result {
+                        Ok(text) => {
+                            let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+                            match app.init_focus {
+                                InitFocus::Ticket => app.ticket_input.push_str(&clean),
+                                InitFocus::Password => app.password_input.push_str(&clean),
+                            }
+                        }
+                        Err(e) => {
+                            app.auth_error = Some(format!("Paste failed: {}", e));
+                        }
+                    }
+                }
+                KeyCode::Char(c) => match app.init_focus {
+                    InitFocus::Ticket => app.ticket_input.push(c),
+                    InitFocus::Password => app.password_input.push(c),
+                },
+                KeyCode::Backspace => match app.init_focus {
+                    InitFocus::Ticket => {
+                        app.ticket_input.pop();
+                    }
+                    InitFocus::Password => {
+                        app.password_input.pop();
+                    }
+                },
+                KeyCode::Enter => {
+                    if app.ticket_input.is_empty() {
+                        app.auth_error = Some("Sync ticket cannot be empty".into());
+                    } else if app.password_input.len() < 8 {
+                        app.auth_error = Some("Password must be at least 8 characters".into());
+                    } else {
+                        match app
+                            .manager
+                            .import_and_init(&app.password_input, &app.ticket_input)
+                            .await
+                        {
+                            Ok(_) => {
+                                app.password_input.clear();
+                                app.ticket_input.clear();
+                                app.auth_error = None;
+                                app.state = AppState::PasswordPrompt;
+                            }
+                            Err(e) => {
+                                app.auth_error = Some(format!("Import failed: {}", e));
+                            }
+                        }
+                    }
+                }
+                KeyCode::Esc => {
+                    // Go back to Welcome menu
+                    app.password_input.clear();
+                    app.ticket_input.clear();
+                    app.auth_error = None;
+                    app.state = AppState::Welcome;
+                }
                 _ => {}
             }
         }
@@ -396,7 +580,7 @@ async fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
                 KeyCode::Backspace => {
                     app.password_input.pop();
                 }
-                KeyCode::Enter => match app.manager.unlock(&app.password_input) {
+                KeyCode::Enter => match app.manager.unlock(&app.password_input).await {
                     Ok(_) => {
                         app.password_input.clear();
                         app.auth_error = None;
@@ -516,6 +700,38 @@ async fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
                             app.update_items_list()?;
                         }
                     }
+                    KeyCode::Char('s') => {
+                        app.sync_ticket = app.manager.export_sync_ticket().await.ok();
+                        app.state = AppState::ShowKeys;
+                    }
+                    // [y] Copy password of selected item to clipboard
+                    KeyCode::Char('y') => {
+                        let pwd = app
+                            .selected_item()
+                            .and_then(|item| item.login.as_ref().and_then(|l| l.password.clone()));
+                        if let Some(pw) = pwd {
+                            let result = app
+                                .clipboard
+                                .as_mut()
+                                .map(|ctx| clipboard_copy(ctx, &pw))
+                                .unwrap_or_else(|| Err(anyhow!("Clipboard unavailable")));
+                            match result {
+                                Ok(_) => {
+                                    app.clipboard_msg = Some((
+                                        "Password copied to clipboard!".into(),
+                                        Instant::now(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    app.clipboard_msg =
+                                        Some((format!("Copy failed: {}", e), Instant::now()));
+                                }
+                            }
+                        } else {
+                            app.clipboard_msg =
+                                Some(("No password to copy.".into(), Instant::now()));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -576,6 +792,42 @@ async fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
                 _ => {}
             }
         }
+        AppState::ShowKeys => {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => {
+                    app.state = AppState::Browse;
+                }
+                // [y] Copy the sync ticket to clipboard
+                KeyCode::Char('y') => {
+                    if let Some(ticket) = app.sync_ticket.clone() {
+                        let result = app
+                            .clipboard
+                            .as_mut()
+                            .map(|ctx| clipboard_copy(ctx, &ticket))
+                            .unwrap_or_else(|| Err(anyhow!("Clipboard unavailable")));
+                        match result {
+                            Ok(_) => {
+                                app.clipboard_msg = Some((
+                                    "Sync ticket copied to clipboard!".into(),
+                                    Instant::now(),
+                                ));
+                            }
+                            Err(e) => {
+                                app.clipboard_msg =
+                                    Some((format!("Copy failed: {}", e), Instant::now()));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Expire clipboard message after 3 seconds
+    if let Some((_, shown_at)) = &app.clipboard_msg {
+        if shown_at.elapsed() > Duration::from_secs(3) {
+            app.clipboard_msg = None;
+        }
     }
     Ok(false)
 }
@@ -595,7 +847,9 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
     // Draw Header
     let status_str = match app.state {
-        AppState::NotInitialized => "NOT INITIALIZED".to_string(),
+        AppState::Welcome | AppState::NotInitialized | AppState::NotInitializedImport => {
+            "NOT INITIALIZED".to_string()
+        }
         AppState::PasswordPrompt => "LOCKED".to_string(),
         _ => "UNLOCKED".to_string(),
     };
@@ -618,21 +872,30 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     ])];
     let header = Paragraph::new(header_text).block(
         Block::default()
-            .borders(Borders::ALL)
+            .borders(Borders::BOTTOM)
             .border_style(Style::default().fg(Color::DarkGray)),
     );
     f.render_widget(header, chunks[0]);
 
     // Draw Main Content based on app state
     match app.state {
+        AppState::Welcome => {
+            draw_welcome_screen(f, chunks[1], app);
+        }
         AppState::NotInitialized => {
             draw_init_screen(f, chunks[1], app);
+        }
+        AppState::NotInitializedImport => {
+            draw_init_import_screen(f, chunks[1], app);
         }
         AppState::PasswordPrompt => {
             draw_lock_screen(f, chunks[1], app);
         }
         AppState::Browse => {
             draw_browse_screen(f, chunks[1], app);
+        }
+        AppState::ShowKeys => {
+            draw_keys_screen(f, chunks[1], app);
         }
         AppState::AddForm | AppState::EditForm => {
             draw_form_screen(f, chunks[1], app);
@@ -641,12 +904,18 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
     // Draw Footer (shortcuts)
     let footer_text = match app.state {
-        AppState::NotInitialized | AppState::PasswordPrompt => {
-            " [Enter] Confirm / Unlock  |  [Esc] Quit"
+        AppState::Welcome => {
+            " [↑/↓] Navigate  |  [Enter] Select  |  [N] New Vault  |  [S] Sync  |  [Esc] Quit"
         }
+        AppState::NotInitialized => " [Enter] Create Vault  |  [Esc] Back",
+        AppState::NotInitializedImport => {
+            " [Tab] Switch Field  |  [Enter] Import & Sync  |  [Esc] Back"
+        }
+        AppState::PasswordPrompt => " [Enter] Unlock  |  [Esc] Quit",
         AppState::Browse => {
-            " [Esc] Reset  |  [/] Search  |  [j/k] Navigate  |  [a] Add  |  [e] Edit  |  [d] Delete  |  [f] Toggle Favorite  |  [p] Toggle Secret  |  [q] Quit"
+            " [/] Search  |  [j/k] Navigate  |  [a] Add  |  [e] Edit  |  [d] Delete  |  [f] Fav  |  [p] Secret  |  [y] Copy Pwd  |  [s] Sync  |  [q] Quit"
         }
+        AppState::ShowKeys => " [y] Copy Ticket  |  [Esc/s/q] Back to Browse",
         AppState::AddForm | AppState::EditForm => {
             " [Tab/Shift-Tab] Switch Field  |  [Ctrl+Enter] Save  |  [Esc] Cancel"
         }
@@ -658,11 +927,103 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(footer, chunks[2]);
 }
 
+fn draw_welcome_screen(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    use ratatui::widgets::BorderType;
+
+    let block = Block::default()
+        .title(" Welcome to Keyroh ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4), // tagline
+            Constraint::Length(1), // spacer
+            Constraint::Length(3), // option 1
+            Constraint::Length(3), // option 2
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    let tagline = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  Keyroh",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " — End-to-end encrypted, P2P-synced password vault.",
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            "  Choose how to get started:",
+            Style::default().fg(Color::DarkGray),
+        )]),
+    ]);
+    f.render_widget(tagline, layout[0]);
+
+    let is_create = app.welcome_choice == WelcomeChoice::Create;
+    let is_sync = app.welcome_choice == WelcomeChoice::Sync;
+
+    let create_style = if is_create {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    let sync_style = if is_sync {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+
+    let create_prefix = if is_create { "▶ " } else { "  " };
+    let sync_prefix = if is_sync { "▶ " } else { "  " };
+
+    let opt_create = Paragraph::new(vec![
+        Line::from(vec![Span::styled(
+            format!("  {}[N]  New Vault", create_prefix),
+            create_style,
+        )]),
+        Line::from(vec![Span::styled(
+            "       Create a brand-new encrypted vault on this device.",
+            Style::default().fg(Color::DarkGray),
+        )]),
+    ]);
+    f.render_widget(opt_create, layout[2]);
+
+    let opt_sync = Paragraph::new(vec![
+        Line::from(vec![Span::styled(
+            format!("  {}[S]  Sync Existing Vault", sync_prefix),
+            sync_style,
+        )]),
+        Line::from(vec![Span::styled(
+            "       Import a Sync Ticket to replicate a vault from another device.",
+            Style::default().fg(Color::DarkGray),
+        )]),
+    ]);
+    f.render_widget(opt_sync, layout[3]);
+}
+
 fn draw_init_screen(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let block = Block::default()
-        .title(" Initialize Vault ")
+        .title(" Create New Vault ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(Style::default().fg(Color::Green));
 
     let content_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -677,7 +1038,7 @@ fn draw_init_screen(f: &mut ratatui::Frame, area: Rect, app: &App) {
     f.render_widget(block, area);
 
     let intro = Paragraph::new(
-        "Welcome to Keyroh! Please create a master password to initialize your secure vault.\nPassword should be at least 8 characters long.",
+        "Create a master password for your new vault.\nPassword must be at least 8 characters long.",
     );
     f.render_widget(intro, content_chunks[0]);
 
@@ -686,7 +1047,7 @@ fn draw_init_screen(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let password_box = Paragraph::new(password_stars).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Enter Master Password "),
+            .title(" Master Password "),
     );
     f.render_widget(password_box, content_chunks[1]);
 
@@ -802,7 +1163,7 @@ fn draw_browse_screen(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         let details_layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(7), // Basic credentials
+                Constraint::Length(8), // Basic credentials
                 Constraint::Length(4), // TOTP code if exists
                 Constraint::Min(4),    // Custom fields & Notes
             ])
@@ -827,6 +1188,20 @@ fn draw_browse_screen(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
 
         let folder = item.folder_id.as_deref().unwrap_or("None");
 
+        let cb_hint = if let Some((ref msg, _)) = app.clipboard_msg {
+            Line::from(vec![Span::styled(
+                format!("  ✓ {}", msg),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )])
+        } else {
+            Line::from(vec![Span::styled(
+                "  [y] Copy password  [p] Toggle reveal",
+                Style::default().fg(Color::DarkGray),
+            )])
+        };
+
         let basic_text = vec![
             Line::from(vec![
                 Span::styled("Name:       ", Style::default().fg(Color::Cyan)),
@@ -840,6 +1215,7 @@ fn draw_browse_screen(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 Span::styled("Password:   ", Style::default().fg(Color::Cyan)),
                 Span::raw(displayed_password),
             ]),
+            cb_hint,
             Line::from(vec![
                 Span::styled("URL:        ", Style::default().fg(Color::Cyan)),
                 Span::raw(url),
@@ -1019,4 +1395,138 @@ fn draw_form_screen(f: &mut ratatui::Frame, area: Rect, app: &App) {
         )
         .wrap(Wrap { trim: true });
     f.render_widget(notes_p, form_layout[7]);
+}
+
+fn draw_keys_screen(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    use ratatui::widgets::BorderType;
+
+    let block = Block::default()
+        .title(" Keyroh Cryptographic Keys & Sync Status ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let ticket = app
+        .sync_ticket
+        .as_deref()
+        .unwrap_or("N/A (Vault Locked/Error)");
+
+    let status = app.manager.get_status().unwrap_or_default();
+    let namespace_id = status["namespace_id"].as_str().unwrap_or("N/A");
+    let author_id = status["author_id"].as_str().unwrap_or("N/A");
+
+    // Build clipboard feedback line
+    let cb_line = if let Some((ref msg, _)) = app.clipboard_msg {
+        Line::from(vec![Span::styled(
+            format!("  ✓ {}", msg),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )])
+    } else {
+        Line::from(vec![Span::styled(
+            "  Press [y] to copy Sync Ticket to clipboard.",
+            Style::default().fg(Color::DarkGray),
+        )])
+    };
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  Namespace ID (Public ID):  ",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(namespace_id, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  Author ID (Public ID):     ",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(author_id, Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Sync Ticket (Invitation):",
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(vec![Span::styled(
+            ticket,
+            Style::default().fg(Color::Yellow),
+        )]),
+        Line::from(""),
+        cb_line,
+        Line::from(""),
+        Line::from("  [!] Keep this ticket secure — it grants full vault access."),
+        Line::from(""),
+        Line::from("  Press [Esc] or [s] to return to browsing."),
+    ];
+
+    let para = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
+    f.render_widget(para, area);
+}
+
+fn draw_init_import_screen(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .title(" Import Sync Ticket ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let content_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Intro text
+            Constraint::Length(4), // Ticket Input
+            Constraint::Length(3), // Password Input
+            Constraint::Length(2), // Error message
+            Constraint::Min(1),
+        ])
+        .split(block.inner(area));
+
+    f.render_widget(block, area);
+
+    let intro = Paragraph::new(
+        "Import an existing Sync Ticket to replicate the vault locally.\nYou will need to enter the vault's master password.",
+    );
+    f.render_widget(intro, content_chunks[0]);
+
+    // Ticket Input Box
+    let is_ticket_focused = app.init_focus == InitFocus::Ticket;
+    let ticket_border = if is_ticket_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let ticket_box = Paragraph::new(app.ticket_input.as_str())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(ticket_border)
+                .title(" Enter Sync Ticket "),
+        )
+        .wrap(Wrap { trim: true });
+    f.render_widget(ticket_box, content_chunks[1]);
+
+    // Password Input Box
+    let is_password_focused = app.init_focus == InitFocus::Password;
+    let password_border = if is_password_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let password_stars = "*".repeat(app.password_input.len());
+    let password_box = Paragraph::new(password_stars).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(password_border)
+            .title(" Enter Master Password "),
+    );
+    f.render_widget(password_box, content_chunks[2]);
+
+    // Error display
+    if let Some(ref err) = app.auth_error {
+        let error_para = Paragraph::new(Span::styled(err, Style::default().fg(Color::Red)));
+        f.render_widget(error_para, content_chunks[3]);
+    }
 }

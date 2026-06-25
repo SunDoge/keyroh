@@ -99,20 +99,20 @@ enum Commands {
     #[command(about = "Delete a login entry by ID")]
     Delete { id: String },
 
-    #[command(about = "Export replica sync keys")]
+    #[command(about = "Export replica sync ticket")]
     ExportKeys,
 
-    #[command(about = "Import replica sync keys and initialize local password")]
+    #[command(about = "Import replica sync ticket and initialize local password")]
     ImportKeys {
-        #[arg(long, help = "Namespace secret key (hex)")]
-        ns_secret: String,
-        #[arg(long, help = "Author key (hex)")]
-        author: String,
+        #[arg(long, help = "Sync ticket string")]
+        ticket: String,
     },
 }
 
 fn get_vault_dir(custom_dir: Option<String>) -> PathBuf {
     if let Some(d) = custom_dir {
+        PathBuf::from(d)
+    } else if let Ok(d) = std::env::var("KEYROH_DATA_DIR") {
         PathBuf::from(d)
     } else {
         let mut path = std::env::var("HOME")
@@ -125,7 +125,7 @@ fn get_vault_dir(custom_dir: Option<String>) -> PathBuf {
 }
 
 async fn get_unlocked_manager(dir: &Path) -> Result<VaultManager> {
-    let mut manager = VaultManager::open(dir)?;
+    let mut manager = VaultManager::open(dir).await?;
     if !manager.is_initialized()? {
         return Err(anyhow!(
             "Vault is not initialized. Run 'keyroh init' first."
@@ -134,12 +134,15 @@ async fn get_unlocked_manager(dir: &Path) -> Result<VaultManager> {
 
     // Check if session environment variable is set
     if let Ok(session_key) = std::env::var("KEYROH_SESSION") {
-        manager.unlock_with_session(&session_key)?;
+        manager.unlock_with_session(&session_key).await?;
     } else {
-        // If not set, prompt for master password
-        let password =
-            rpassword::prompt_password("\x1b[36mEnter master password to unlock vault:\x1b[0m ")?;
-        manager.unlock(&password)?;
+        // If not set, check KEYROH_PASSWORD environment variable, else prompt
+        let password = if let Ok(pwd) = std::env::var("KEYROH_PASSWORD") {
+            pwd
+        } else {
+            rpassword::prompt_password("\x1b[36mEnter master password to unlock vault:\x1b[0m ")?
+        };
+        manager.unlock(&password).await?;
     }
 
     Ok(manager)
@@ -339,7 +342,7 @@ async fn main() {
 async fn execute_command(command: Commands, vault_dir: &Path) -> Result<()> {
     match command {
         Commands::Init => {
-            let mut manager = VaultManager::open(vault_dir)?;
+            let mut manager = VaultManager::open(vault_dir).await?;
             if manager.is_initialized()? {
                 return Err(anyhow!("Vault is already initialized at {:?}", vault_dir));
             }
@@ -348,39 +351,48 @@ async fn execute_command(command: Commands, vault_dir: &Path) -> Result<()> {
                 "\x1b[1;36mInitializing a new Keyroh Vault at {:?}\x1b[0m",
                 vault_dir
             );
-            let password = rpassword::prompt_password("Choose a master password: ")?;
-            if password.len() < 8 {
-                return Err(anyhow!(
-                    "Master password should be at least 8 characters long"
-                ));
-            }
+            let password = if let Ok(pwd) = std::env::var("KEYROH_PASSWORD") {
+                pwd
+            } else {
+                let password = rpassword::prompt_password("Choose a master password: ")?;
+                if password.len() < 8 {
+                    return Err(anyhow!(
+                        "Master password should be at least 8 characters long"
+                    ));
+                }
 
-            let confirm = rpassword::prompt_password("Confirm master password: ")?;
-            if password != confirm {
-                return Err(anyhow!("Passwords do not match"));
-            }
+                let confirm = rpassword::prompt_password("Confirm master password: ")?;
+                if password != confirm {
+                    return Err(anyhow!("Passwords do not match"));
+                }
+                password
+            };
 
-            manager.init(&password)?;
+            manager.init(&password).await?;
             print_success("Vault successfully initialized!");
             print_info("Use 'keyroh unlock' to start a session.");
         }
 
         Commands::Unlock => {
-            let mut manager = VaultManager::open(vault_dir)?;
+            let mut manager = VaultManager::open(vault_dir).await?;
             if !manager.is_initialized()? {
                 return Err(anyhow!(
                     "Vault is not initialized. Run 'keyroh init' first."
                 ));
             }
 
-            let password = rpassword::prompt_password("Enter master password to unlock: ")?;
-            match manager.unlock(&password) {
+            let password = if let Ok(pwd) = std::env::var("KEYROH_PASSWORD") {
+                pwd
+            } else {
+                rpassword::prompt_password("Enter master password to unlock: ")?
+            };
+            match manager.unlock(&password).await {
                 Ok(session_key) => {
                     print_success("Vault unlocked successfully!");
                     println!(
                         "\nTo set your session key, run the following command in your terminal:"
                     );
-                    println!("\x1b[1;32mexport KEYROH_SESSION={}\x1b[0m\n", session_key);
+                    println!("\x1b[1;32mexport KEYROH_SESSION={}\x1b[0m\n", *session_key);
                     print_info(
                         "Copy the command above. Subsequent commands in this terminal session will read the session key directly.",
                     );
@@ -397,7 +409,7 @@ async fn execute_command(command: Commands, vault_dir: &Path) -> Result<()> {
         }
 
         Commands::Status => {
-            let manager = VaultManager::open(vault_dir)?;
+            let manager = VaultManager::open(vault_dir).await?;
             let status = manager.get_status()?;
 
             println!("\x1b[1;36mKeyroh Vault Status\x1b[0m");
@@ -599,7 +611,7 @@ async fn execute_command(command: Commands, vault_dir: &Path) -> Result<()> {
             let new_username =
                 username.or_else(|| prompt_string_opt("Username", ex_username.as_deref()));
             let new_password = password.or_else(|| {
-                rpassword::prompt_password(&format!("Password (press Enter to keep existing): "))
+                rpassword::prompt_password("Password (press Enter to keep existing): ")
                     .ok()
                     .filter(|s| !s.is_empty())
                     .or(ex_password)
@@ -670,45 +682,47 @@ async fn execute_command(command: Commands, vault_dir: &Path) -> Result<()> {
 
         Commands::ExportKeys => {
             let manager = get_unlocked_manager(vault_dir).await?;
-            let (ns_secret, author) = manager.export_replica_keys()?;
+            let ticket = manager.export_sync_ticket().await?;
 
-            println!("\n\x1b[1;35mKeyroh Sync Keys (KEEP THESE SECRET!)\x1b[0m");
+            println!("\n\x1b[1;35mKeyroh Sync Ticket (KEEP THIS SECRET!)\x1b[0m");
             println!("\x1b[90m==================================================\x1b[0m");
-            println!("\x1b[1mNamespace Secret (Replica Key):\x1b[0m");
-            println!("\x1b[32m{}\x1b[0m", ns_secret);
-            println!("\n\x1b[1mAuthor Secret Key:\x1b[0m");
-            println!("\x1b[32m{}\x1b[0m", author);
+            println!("\x1b[32m{}\x1b[0m", ticket);
             println!("\x1b[90m==================================================\x1b[0m");
             print_info(
-                "Use these keys with 'keyroh import-keys' on another device to replicate this vault.",
+                "Use this ticket with 'keyroh import-keys' on another device to replicate this vault.",
             );
         }
 
-        Commands::ImportKeys { ns_secret, author } => {
-            let mut manager = VaultManager::open(vault_dir)?;
+        Commands::ImportKeys { ticket } => {
+            let mut manager = VaultManager::open(vault_dir).await?;
             if manager.is_initialized()? {
                 return Err(anyhow!(
-                    "Cannot import keys into an already initialized vault. Clear the storage directory {:?} first.",
+                    "Cannot import ticket into an already initialized vault. Clear the storage directory {:?} first.",
                     vault_dir
                 ));
             }
 
-            println!("\x1b[1;36mImporting Replica Sync Keys and Initializing Local Vault\x1b[0m");
-            let password =
-                rpassword::prompt_password("Choose a master password for THIS device: ")?;
-            if password.len() < 8 {
-                return Err(anyhow!(
-                    "Master password should be at least 8 characters long"
-                ));
-            }
+            println!("\x1b[1;36mImporting Replica Sync Ticket and Initializing Local Vault\x1b[0m");
+            let password = if let Ok(pwd) = std::env::var("KEYROH_PASSWORD") {
+                pwd
+            } else {
+                let password =
+                    rpassword::prompt_password("Choose a master password for THIS device: ")?;
+                if password.len() < 8 {
+                    return Err(anyhow!(
+                        "Master password should be at least 8 characters long"
+                    ));
+                }
 
-            let confirm = rpassword::prompt_password("Confirm master password: ")?;
-            if password != confirm {
-                return Err(anyhow!("Passwords do not match"));
-            }
+                let confirm = rpassword::prompt_password("Confirm master password: ")?;
+                if password != confirm {
+                    return Err(anyhow!("Passwords do not match"));
+                }
+                password
+            };
 
-            manager.import_and_init(&password, &ns_secret, &author)?;
-            print_success("Keys successfully imported and local vault initialized!");
+            manager.import_and_init(&password, &ticket).await?;
+            print_success("Ticket successfully imported and local vault initialized!");
             print_info(
                 "Subsequent sync reconciliations can now take place. Run 'keyroh list' to view cache.",
             );
