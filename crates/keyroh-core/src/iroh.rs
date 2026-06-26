@@ -25,8 +25,18 @@ pub struct Iroh {
 
 impl Iroh {
     pub async fn new(path: PathBuf) -> Result<Self> {
-        // create dir if it doesn't already exist
+        // Create the vault directory and, on Unix, restrict it to the owner
+        // (0700) so other local users cannot browse the encrypted blob files.
         tokio::fs::create_dir_all(&path).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o700);
+                let _ = std::fs::set_permissions(&path, perms);
+            }
+        }
 
         let key = load_secret_key(path.clone().join("keypair")).await?;
 
@@ -72,6 +82,52 @@ impl Iroh {
 
     pub fn endpoint(&self) -> &iroh::Endpoint {
         self.router.endpoint()
+    }
+
+    /// Poll an iroh document for a specific entry key, waiting up to `timeout`
+    /// for it to arrive via P2P sync.  Returns the raw blob bytes.
+    pub async fn fetch_doc_entry_bytes(
+        &self,
+        namespace_id: NamespaceId,
+        key: &[u8],
+        timeout: std::time::Duration,
+    ) -> Result<bytes::Bytes> {
+        let doc = self.docs.open(namespace_id).await?.ok_or_else(|| {
+            anyhow!(
+                "Namespace not found while fetching entry '{}'",
+                String::from_utf8_lossy(key)
+            )
+        })?;
+
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let stream = doc.get_many(Query::all()).await?;
+            tokio::pin!(stream);
+            while let Some(entry_res) = stream.next().await {
+                let entry = entry_res.context("Failed to read doc entry")?;
+                if entry.key() == key && entry.content_len() > 0 {
+                    let blob = self
+                        .store
+                        .blobs()
+                        .get_bytes(entry.content_hash())
+                        .await
+                        .context("Failed to fetch blob content")?;
+                    return Ok(blob);
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "Timed out ({}s) waiting for '{}' from P2P peers. \
+                     Ensure the source device is reachable.",
+                    timeout.as_secs(),
+                    String::from_utf8_lossy(key)
+                ));
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -145,6 +201,12 @@ pub async fn load_secret_key(key_path: PathBuf) -> Result<SecretKey> {
     // 2. Try loading from fallback file
     if key_path.exists() {
         let key_bytes = tokio::fs::read(&key_path).await?;
+        if key_bytes.len() < 32 {
+            return Err(anyhow!(
+                "keypair file is too short ({} bytes)",
+                key_bytes.len()
+            ));
+        }
         let secret_key = SecretKey::try_from(&key_bytes[0..32])?;
 
         if !keyring_disabled {

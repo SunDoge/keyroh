@@ -1,3 +1,4 @@
+pub mod bitwarden_import;
 pub mod crypto;
 pub mod iroh;
 pub mod manager;

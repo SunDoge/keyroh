@@ -5,6 +5,7 @@ pub use iroh_docs::engine::LiveEvent;
 use iroh_docs::{Author, AuthorId, NamespaceId, NamespaceSecret};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use uuid::Uuid;
@@ -12,23 +13,40 @@ use zeroize::Zeroize;
 
 use crate::crypto;
 use crate::iroh;
-use crate::vault::{CustomField, LoginDetails, VaultItem};
+use crate::vault::{CustomField, ItemData, LoginDetails, UriEntry, VaultItem};
 
+/// Outer envelope for every item blob stored in iroh.
+///
+/// Serialized with msgpack (`rmp-serde`): binary fields are native (no
+/// base64) and new named fields can be added without breaking old clients
+/// — unknown fields are silently ignored on deserialization.
+#[derive(Serialize, Deserialize)]
+struct ItemEnvelope {
+    /// DEK version used to encrypt `cipher`.  Resolves to `_meta/dek/<dek_v>`.
+    dek_v: u32,
+    /// AES-256-GCM nonce (12 bytes).
+    #[serde(with = "serde_bytes")]
+    nonce: Vec<u8>,
+    /// AES-256-GCM ciphertext (without nonce).
+    #[serde(with = "serde_bytes")]
+    cipher: Vec<u8>,
+}
+
+/// Persisted per-device vault state (state.json).
+///
+/// The master key is never stored — it is derived on demand via
+/// `Argon2id(password, salt)`.  The salt is the single shared secret
+/// bootstrapped from the source device during `import_and_init`.
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct LocalState {
+    /// Hex-encoded 16-byte Argon2id salt, shared across all devices.
     pub salt: String,
-    pub encrypted_master_key: String,
+    /// AES-256-GCM ciphertext of the iroh NamespaceSecret, keyed by master_key.
     pub encrypted_ns_secret: String,
+    /// AES-256-GCM ciphertext of this device's iroh Author key, keyed by master_key.
     pub encrypted_author: String,
     pub namespace_id: String,
     pub author_id: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct KeyrohSyncTicket {
-    pub iroh_ticket: String,
-    pub salt: String,
-    pub encrypted_master_key: String,
 }
 
 #[derive(Clone)]
@@ -36,6 +54,7 @@ pub struct MasterKey(Box<[u8; 32]>);
 
 impl MasterKey {
     pub fn new(bytes: [u8; 32]) -> Self {
+        #[allow(unused_mut)] // as_mut_ptr() is called in the Linux mlock block
         let mut inner = Box::new(bytes);
         #[cfg(target_os = "linux")]
         unsafe {
@@ -88,11 +107,18 @@ pub struct UnlockedState {
     pub namespace_id: NamespaceId,
     pub author_id: AuthorId,
     pub items: Vec<VaultItem>,
+    /// All known DEK versions: version number → raw key bytes.
+    pub deks: HashMap<u32, [u8; 32]>,
+    /// The highest DEK version — used when encrypting new items.
+    pub current_dek_version: u32,
 }
 
 impl Drop for UnlockedState {
     fn drop(&mut self) {
         self.master_key.zeroize();
+        for dek in self.deks.values_mut() {
+            dek.zeroize();
+        }
     }
 }
 
@@ -145,7 +171,7 @@ impl VaultManager {
         }
         let state_str = std::fs::read_to_string(&state_path)?;
         let state: LocalState = serde_json::from_str(&state_str)?;
-        Ok(!state.salt.is_empty() && !state.encrypted_master_key.is_empty())
+        Ok(!state.salt.is_empty() && !state.encrypted_ns_secret.is_empty())
     }
 
     /// Initializes a new vault with a master password.
@@ -154,40 +180,81 @@ impl VaultManager {
             return Err(anyhow!("Vault is already initialized"));
         }
 
-        // 1. Generate master key
-        let mut master_key = [0u8; 32];
-        rand::rng().fill_bytes(&mut master_key);
-
-        // 2. Derive KEK and encrypt master key
+        // 1. Generate a random salt and derive the master key directly.
+        //    master_key = Argon2id(password, salt) — no separate random key needed.
+        //    The salt is the only thing that needs to be shared with other devices;
+        //    they can derive the same master key from password + salt independently.
         let mut salt = [0u8; 16];
         rand::rng().fill_bytes(&mut salt);
 
-        let mut kek = [0u8; 32];
-        crypto::derive_key(master_password, &salt, &mut kek);
+        let mut master_key = [0u8; 32];
+        crypto::derive_key(master_password, &salt, &mut master_key);
 
-        let encrypted_master_key = crypto::encrypt(&master_key, &kek)?;
-
-        // 3. Create document replica and author in iroh-docs
+        // 2. Create document replica and author in iroh-docs.
         let (ns_secret, author) = iroh::create_vault_replica(self.iroh.docs()).await?;
         let namespace_id = ns_secret.id();
         let author_id = author.id();
 
-        // 4. Encrypt replica keys with the master key
+        // 3. Encrypt the iroh replica keys with the master key.
         let mut ns_bytes = ns_secret.to_bytes();
         let mut author_bytes = author.to_bytes();
 
-        let encrypted_ns = crypto::encrypt(&ns_bytes, &master_key)?;
-        let encrypted_author = crypto::encrypt(&author_bytes, &master_key)?;
+        let encrypted_ns = crypto::encrypt_blob(&ns_bytes, &master_key)?;
+        let encrypted_author = crypto::encrypt_blob(&author_bytes, &master_key)?;
 
-        master_key.zeroize();
-        kek.zeroize();
         ns_bytes.zeroize();
         author_bytes.zeroize();
 
-        // 5. Store everything in persistent JSON file
+        // 4. Publish the salt as a plaintext entry in the iroh document.
+        //    The salt is not secret — Argon2id is designed for a public salt.
+        //    Other devices fetch this entry over P2P, combine it with the
+        //    password, and derive the same master key locally.
+        iroh::insert_doc_bytes(
+            self.iroh.docs(),
+            &namespace_id,
+            &author,
+            b"_meta/salt",
+            bytes::Bytes::copy_from_slice(&salt),
+        )
+        .await
+        .context("Failed to write salt entry to iroh document")?;
+
+        // Write a password-verification tag: AES-GCM(salt_bytes, master_key).
+        // An importing device decrypts this after deriving its master key; if
+        // decryption fails the user entered the wrong password and no corrupted
+        // state.json is ever written.
+        let auth_tag = crypto::encrypt_blob(&salt, &master_key)?;
+        iroh::insert_doc_bytes(
+            self.iroh.docs(),
+            &namespace_id,
+            &author,
+            b"_meta/auth_tag",
+            auth_tag.into(),
+        )
+        .await
+        .context("Failed to write auth tag to iroh document")?;
+
+        // Generate DEK v1 — the random key used to encrypt vault items.
+        // Stored encrypted with master_key; iroh key: `_meta/dek/1`.
+        let mut dek_v1 = [0u8; 32];
+        rand::rng().fill_bytes(&mut dek_v1);
+        let enc_dek = crypto::encrypt_blob(&dek_v1, &master_key)?;
+        iroh::insert_doc_bytes(
+            self.iroh.docs(),
+            &namespace_id,
+            &author,
+            b"_meta/dek/1",
+            enc_dek.into(),
+        )
+        .await
+        .context("Failed to write DEK v1 to iroh document")?;
+        dek_v1.zeroize();
+
+        master_key.zeroize();
+
+        // 5. Persist state locally.
         let state = LocalState {
             salt: hex::encode(salt),
-            encrypted_master_key: hex::encode(encrypted_master_key),
             encrypted_ns_secret: hex::encode(encrypted_ns),
             encrypted_author: hex::encode(encrypted_author),
             namespace_id: namespace_id.to_string(),
@@ -195,48 +262,57 @@ impl VaultManager {
         };
         let state_path = self.base_dir.join("state.json");
         let state_str = serde_json::to_string_pretty(&state)?;
-        std::fs::write(state_path, state_str)?;
+        std::fs::write(&state_path, state_str)?;
+        // Restrict state.json to owner-only read/write (0600) so other local
+        // users cannot access the encrypted master key or salt.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&state_path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(&state_path, perms);
+            }
+        }
 
         Ok(())
     }
 
-    /// Unlocks the vault with the master password, decrypting the master key.
-    /// Returns the decrypted master key as hex (wrapped in Zeroizing).
+    /// Unlocks the vault by deriving the master key from `password + salt`.
+    ///
+    /// Returns the derived master key as hex in a `Zeroizing` wrapper so the
+    /// caller can export it as `KEYROH_SESSION` for subsequent CLI commands.
     pub async fn unlock(&mut self, master_password: &str) -> Result<zeroize::Zeroizing<String>> {
         if !self.is_initialized()? {
             return Err(anyhow!("Vault has not been initialized. Run init first."));
         }
 
-        // 1. Fetch salt and encrypted master key
         let state_path = self.base_dir.join("state.json");
         let state_str = std::fs::read_to_string(&state_path)?;
         let state: LocalState = serde_json::from_str(&state_str)?;
 
         let salt = hex::decode(&state.salt).context("Failed to decode salt hex")?;
-        let enc_master_key = hex::decode(&state.encrypted_master_key)
-            .context("Failed to decode encrypted master key hex")?;
 
-        // 2. Derive KEK
-        let mut kek = [0u8; 32];
-        crypto::derive_key(master_password, &salt, &mut kek);
-
-        // 3. Decrypt master key
-        let mut master_key_vec = crypto::decrypt(&enc_master_key, &kek)
-            .map_err(|_| anyhow!("Incorrect master password"))?;
-
+        // Derive master key directly — no KEK layer, no stored encrypted key.
+        // Wrong password → decryption of ns_secret/author fails in load_unlocked_state.
         let mut master_key_raw = [0u8; 32];
-        master_key_raw.copy_from_slice(&master_key_vec);
+        crypto::derive_key(master_password, &salt, &mut master_key_raw);
 
         let master_key = MasterKey::new(master_key_raw);
         master_key_raw.zeroize();
 
         let master_key_hex = zeroize::Zeroizing::new(hex::encode(master_key.as_bytes()));
 
-        // 4. Open index
-        self.load_unlocked_state(master_key).await?;
-
-        kek.zeroize();
-        master_key_vec.zeroize();
+        // A wrong password produces the correct-length key bytes but the
+        // AES-GCM auth tag on the stored ns_secret/author will fail → map to
+        // a user-friendly message here rather than leaking the internal error.
+        self.load_unlocked_state(master_key).await.map_err(|e| {
+            if e.to_string().contains("Failed to decrypt") {
+                anyhow!("Incorrect master password")
+            } else {
+                e
+            }
+        })?;
 
         Ok(master_key_hex)
     }
@@ -273,11 +349,21 @@ impl VaultManager {
         let enc_author = hex::decode(&state.encrypted_author)?;
 
         // 2. Decrypt replica keys
-        let mut ns_bytes_vec = crypto::decrypt(&enc_ns, master_key.as_bytes())
+        let mut ns_bytes_vec = crypto::decrypt_blob(&enc_ns, master_key.as_bytes())
             .context("Failed to decrypt namespace secret")?;
-        let mut author_bytes_vec = crypto::decrypt(&enc_author, master_key.as_bytes())
+        let mut author_bytes_vec = crypto::decrypt_blob(&enc_author, master_key.as_bytes())
             .context("Failed to decrypt author")?;
 
+        if ns_bytes_vec.len() != 32 {
+            return Err(anyhow!(
+                "Decrypted namespace secret has unexpected length (corrupted state?)"
+            ));
+        }
+        if author_bytes_vec.len() != 32 {
+            return Err(anyhow!(
+                "Decrypted author bytes have unexpected length (corrupted state?)"
+            ));
+        }
         let mut ns_bytes = [0u8; 32];
         let mut author_bytes = [0u8; 32];
         ns_bytes.copy_from_slice(&ns_bytes_vec);
@@ -294,38 +380,70 @@ impl VaultManager {
         let namespace_id = ns_secret.id();
         let author_id = author.id();
 
-        // 3. Load replica entries from iroh-docs and populate memory list
+        // 3. Two-pass scan: DEKs must be loaded before items because item
+        //    decryption needs the DEK referenced in each envelope.
+        let mut deks: HashMap<u32, [u8; 32]> = HashMap::new();
         let mut items = Vec::new();
         let entries = iroh::get_replica_entries(self.iroh.docs(), namespace_id).await?;
 
-        for signed_entry in entries {
-            let key = signed_entry.key();
-            let key_str = String::from_utf8_lossy(key);
-
-            // Vault item keys look like: "items/<uuid>"
-            if key_str.starts_with("items/") {
-                let id = &key_str["items/".len()..];
-                // If content len is 0, it means it is a tombstone / deleted entry
-                if signed_entry.content_len() == 0 {
-                    items.retain(|item: &VaultItem| item.id != id);
-                    continue;
-                }
-
-                let content_hash = signed_entry.content_hash();
-
-                // Fetch encrypted blob from iroh-blobs
-                if let Ok(enc_content) = self.iroh.blobs().get_bytes(content_hash).await {
-                    // Decrypt blob
-                    if let Ok(dec_bytes) = crypto::decrypt(&enc_content, master_key.as_bytes()) {
-                        // Parse VaultItem
-                        if let Ok(item) = serde_json::from_slice::<VaultItem>(&dec_bytes) {
-                            items.retain(|existing: &VaultItem| existing.id != item.id);
-                            items.push(item);
+        // Pass 1: load all DEK versions.
+        for signed_entry in &entries {
+            let key_str = String::from_utf8_lossy(signed_entry.key());
+            if !key_str.starts_with("_meta/dek/") || signed_entry.content_len() == 0 {
+                continue;
+            }
+            let ver_str = &key_str["_meta/dek/".len()..];
+            if let Ok(ver) = ver_str.parse::<u32>() {
+                if let Ok(enc_dek) = self
+                    .iroh
+                    .blobs()
+                    .get_bytes(signed_entry.content_hash())
+                    .await
+                {
+                    if let Ok(dek_bytes) = crypto::decrypt_blob(&enc_dek, master_key.as_bytes()) {
+                        if dek_bytes.len() == 32 {
+                            let mut dek = [0u8; 32];
+                            dek.copy_from_slice(&dek_bytes);
+                            deks.insert(ver, dek);
                         }
                     }
                 }
             }
         }
+
+        // Pass 2: decrypt vault items using the loaded DEKs.
+        for signed_entry in &entries {
+            let key_str = String::from_utf8_lossy(signed_entry.key());
+            if !key_str.starts_with("items/") {
+                continue;
+            }
+            let id = &key_str["items/".len()..];
+            if signed_entry.content_len() == 0 {
+                items.retain(|item: &VaultItem| item.id != id);
+                continue;
+            }
+            if let Ok(blob) = self
+                .iroh
+                .blobs()
+                .get_bytes(signed_entry.content_hash())
+                .await
+            {
+                if let Ok(envelope) = rmp_serde::from_slice::<ItemEnvelope>(&blob) {
+                    if let Some(dek) = deks.get(&envelope.dek_v) {
+                        if let Ok(nonce) = <[u8; 12]>::try_from(envelope.nonce.as_slice()) {
+                            if let Ok(dec_bytes) = crypto::decrypt(&nonce, &envelope.cipher, dek) {
+                                if let Ok(item) = serde_json::from_slice::<VaultItem>(&dec_bytes) {
+                                    items.retain(|existing: &VaultItem| existing.id != item.id);
+                                    items.push(item);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let current_dek_version = deks.keys().copied().max().unwrap_or(0);
 
         self.unlocked = Some(UnlockedState {
             master_key,
@@ -334,6 +452,8 @@ impl VaultManager {
             namespace_id,
             author_id,
             items,
+            deks,
+            current_dek_version,
         });
 
         Ok(())
@@ -389,7 +509,7 @@ impl VaultManager {
         }))
     }
 
-    /// Adds a login password item to the vault.
+    /// Adds a new login item to the vault.
     pub async fn add_item(
         &mut self,
         name: String,
@@ -397,51 +517,54 @@ impl VaultManager {
         password: Option<String>,
         totp: Option<String>,
         notes: Option<String>,
-        uris: Vec<String>,
+        uris: Vec<UriEntry>,
         favorite: bool,
         fields: Vec<CustomField>,
         folder_id: Option<String>,
     ) -> Result<VaultItem> {
-        let (master_key, namespace_id, _ns_secret, author) = {
+        let (namespace_id, author, dek_v, dek) = {
             let state = self.get_unlocked()?;
-            (
-                state.master_key.clone(),
-                state.namespace_id,
-                state.ns_secret.clone(),
-                state.author.clone(),
-            )
+            let v = state.current_dek_version;
+            let dek = *state
+                .deks
+                .get(&v)
+                .ok_or_else(|| anyhow!("No DEK found — was the vault properly initialized?"))?;
+            (state.namespace_id, state.author.clone(), v, dek)
         };
 
         // 1. Construct VaultItem
         let id = Uuid::new_v4().to_string();
-        let revision_date = Utc::now().to_rfc3339();
-
-        let login =
-            if username.is_some() || password.is_some() || totp.is_some() || !uris.is_empty() {
-                Some(LoginDetails {
-                    username,
-                    password,
-                    uris,
-                    totp,
-                })
-            } else {
-                None
-            };
+        let now = Utc::now().to_rfc3339();
 
         let item = VaultItem {
             id: id.clone(),
             name,
             notes,
-            login,
             favorite,
-            revision_date,
+            reprompt: false,
             folder_id,
             fields,
+            password_history: vec![],
+            creation_date: now.clone(),
+            revision_date: now,
+            data: ItemData::Login {
+                login: LoginDetails {
+                    username,
+                    password,
+                    uris,
+                    totp,
+                },
+            },
         };
 
-        // 2. Serialize and Encrypt
+        // 2. Serialize → encrypt with current DEK → wrap in msgpack envelope
         let item_bytes = serde_json::to_vec(&item)?;
-        let encrypted_bytes = crypto::encrypt(&item_bytes, master_key.as_bytes())?;
+        let (nonce, cipher) = crypto::encrypt(&item_bytes, &dek)?;
+        let blob = rmp_serde::to_vec_named(&ItemEnvelope {
+            dek_v,
+            nonce: nonce.to_vec(),
+            cipher,
+        })?;
 
         // 3. Store entry in iroh-docs and blobs store
         let key = format!("items/{}", id);
@@ -451,7 +574,7 @@ impl VaultManager {
             &namespace_id,
             &author,
             key.as_bytes(),
-            encrypted_bytes.into(),
+            blob.into(),
         )
         .await?;
 
@@ -466,7 +589,7 @@ impl VaultManager {
         Ok(item)
     }
 
-    /// Edits an existing item in the vault.
+    /// Edits an existing login item in the vault.
     pub async fn edit_item(
         &mut self,
         id: String,
@@ -475,55 +598,60 @@ impl VaultManager {
         password: Option<String>,
         totp: Option<String>,
         notes: Option<String>,
-        uris: Vec<String>,
+        uris: Vec<UriEntry>,
         favorite: bool,
         fields: Vec<CustomField>,
         folder_id: Option<String>,
     ) -> Result<VaultItem> {
-        // Verify item exists and get keys
-        let (master_key, namespace_id, _ns_secret, author) = {
+        // Verify item exists and get keys; preserve creation_date and password_history.
+        let (namespace_id, author, dek_v, dek, creation_date, password_history) = {
             let state = self.get_unlocked()?;
-            let _existing = state
+            let existing = state
                 .items
                 .iter()
                 .find(|item| item.id == id)
                 .ok_or_else(|| anyhow!("Item not found: {}", id))?;
+            let v = state.current_dek_version;
+            let dek = *state.deks.get(&v).ok_or_else(|| anyhow!("No DEK found"))?;
             (
-                state.master_key.clone(),
                 state.namespace_id,
-                state.ns_secret.clone(),
                 state.author.clone(),
+                v,
+                dek,
+                existing.creation_date.clone(),
+                existing.password_history.clone(),
             )
         };
-
-        let revision_date = Utc::now().to_rfc3339();
-
-        let login =
-            if username.is_some() || password.is_some() || totp.is_some() || !uris.is_empty() {
-                Some(LoginDetails {
-                    username,
-                    password,
-                    uris,
-                    totp,
-                })
-            } else {
-                None
-            };
 
         let item = VaultItem {
             id: id.clone(),
             name,
             notes,
-            login,
             favorite,
-            revision_date,
+            reprompt: false,
             folder_id,
             fields,
+            password_history,
+            creation_date,
+            revision_date: Utc::now().to_rfc3339(),
+            data: ItemData::Login {
+                login: LoginDetails {
+                    username,
+                    password,
+                    uris,
+                    totp,
+                },
+            },
         };
 
-        // Serialize and Encrypt
+        // Serialize → encrypt with current DEK → wrap in msgpack envelope
         let item_bytes = serde_json::to_vec(&item)?;
-        let encrypted_bytes = crypto::encrypt(&item_bytes, master_key.as_bytes())?;
+        let (nonce, cipher) = crypto::encrypt(&item_bytes, &dek)?;
+        let blob = rmp_serde::to_vec_named(&ItemEnvelope {
+            dek_v,
+            nonce: nonce.to_vec(),
+            cipher,
+        })?;
 
         // Store entry in iroh-docs and blobs store
         let key = format!("items/{}", id);
@@ -533,7 +661,7 @@ impl VaultManager {
             &namespace_id,
             &author,
             key.as_bytes(),
-            encrypted_bytes.into(),
+            blob.into(),
         )
         .await?;
 
@@ -577,13 +705,13 @@ impl VaultManager {
             .iter()
             .filter(|item| {
                 item.name.to_lowercase().contains(&query_lower)
-                    || item.login.as_ref().map_or(false, |l| {
+                    || item.login().map_or(false, |l| {
                         l.username
                             .as_ref()
                             .map_or(false, |u| u.to_lowercase().contains(&query_lower))
                             || l.uris
                                 .iter()
-                                .any(|uri| uri.to_lowercase().contains(&query_lower))
+                                .any(|u| u.uri.to_lowercase().contains(&query_lower))
                     })
                     || item
                         .notes
@@ -621,109 +749,98 @@ impl VaultManager {
         Ok(item)
     }
 
-    /// Exports a replication sync ticket.
+    /// Exports a standard iroh sync ticket.
+    ///
+    /// The ticket is a plain iroh `DocTicket` string — P2P connectivity plus
+    /// the document's write capability.  The Argon2id salt lives in the iroh
+    /// document as `_meta/salt` (plaintext) and is fetched over P2P by the
+    /// importing device, which then derives the master key locally from
+    /// `Argon2id(password, salt)`.  No key material is transmitted.
     pub async fn export_sync_ticket(&self) -> Result<String> {
         if !self.is_initialized()? {
             return Err(anyhow!("Vault not initialized"));
         }
-
         let state = self.get_unlocked()?;
-        // Fetch iroh DocTicket
-        let iroh_ticket = iroh::export_vault_ticket(self.iroh.docs(), state.namespace_id).await?;
-
-        // Read salt and encrypted_master_key from state.json
-        let state_path = self.base_dir.join("state.json");
-        let state_str = std::fs::read_to_string(&state_path)?;
-        let local_state: LocalState = serde_json::from_str(&state_str)?;
-
-        let custom_ticket = KeyrohSyncTicket {
-            iroh_ticket,
-            salt: local_state.salt,
-            encrypted_master_key: local_state.encrypted_master_key,
-        };
-
-        let json_str = serde_json::to_string(&custom_ticket)?;
-        let ticket_hex = hex::encode(json_str);
-
-        Ok(format!("keyroh:{}", ticket_hex))
+        let ticket = iroh::export_vault_ticket(self.iroh.docs(), state.namespace_id).await?;
+        Ok(ticket)
     }
 
-    /// Imports a replica sync ticket AND initializes the master password.
+    /// Imports a standard iroh sync ticket and initializes the local vault.
+    ///
+    /// The salt is fetched in plaintext from `_meta/salt` in the iroh document.
+    /// The master key is never transmitted — each device derives it locally via
+    /// `Argon2id(password, salt)`.  The importing device must be online so that
+    /// P2P sync can deliver the salt entry.
     pub async fn import_and_init(&mut self, master_password: &str, ticket_str: &str) -> Result<()> {
         if self.is_initialized()? {
             return Err(anyhow!("Vault already initialized"));
         }
 
-        // 1. Parse and validate the custom ticket
-        let ticket_str = ticket_str.trim();
-        let hex_data = if let Some(stripped) = ticket_str.strip_prefix("keyroh:") {
-            stripped
-        } else {
-            return Err(anyhow!("Invalid sync ticket: missing 'keyroh:' prefix"));
-        };
+        // 1. Parse the standard iroh DocTicket.
+        let ticket = iroh_docs::DocTicket::from_str(ticket_str.trim())
+            .context("Invalid iroh sync ticket")?;
 
-        let json_bytes =
-            hex::decode(hex_data).context("Invalid sync ticket: not valid hex data")?;
-        let custom_ticket: KeyrohSyncTicket =
-            serde_json::from_slice(&json_bytes).context("Invalid sync ticket JSON structure")?;
-
-        // 2. Decode KEK from master_password and ticket's salt
-        let src_salt = hex::decode(&custom_ticket.salt).context("Invalid salt in ticket")?;
-        let src_enc_master_key = hex::decode(&custom_ticket.encrypted_master_key)
-            .context("Invalid encrypted master key in ticket")?;
-
-        let mut src_kek = [0u8; 32];
-        crypto::derive_key(master_password, &src_salt, &mut src_kek);
-
-        // 3. Decrypt the master key from the ticket
-        let mut master_key_vec = crypto::decrypt(&src_enc_master_key, &src_kek)
-            .map_err(|_| anyhow!("Incorrect master password for the synced vault"))?;
-
-        let mut master_key = [0u8; 32];
-        master_key.copy_from_slice(&master_key_vec);
-
-        // 4. Parse the Iroh DocTicket
-        let ticket = iroh_docs::DocTicket::from_str(&custom_ticket.iroh_ticket)
-            .context("Invalid iroh doc ticket string in ticket")?;
-
-        // 5. Import the iroh doc ticket to start synchronization
+        // 2. Connect to the P2P network and start replication.
         let (ns_secret, author) = iroh::import_vault_ticket(self.iroh.docs(), ticket).await?;
-
         let namespace_id = ns_secret.id();
         let author_id = author.id();
 
-        // 6. Generate a NEW local salt for this device
-        let mut local_salt = [0u8; 16];
-        rand::rng().fill_bytes(&mut local_salt);
+        // 3. Wait for the salt entry to arrive from the source device (up to 30 s).
+        //    The salt is stored as raw bytes in `_meta/salt` and is not secret.
+        let salt_blob = self
+            .iroh
+            .fetch_doc_entry_bytes(
+                namespace_id,
+                b"_meta/salt",
+                std::time::Duration::from_secs(30),
+            )
+            .await?;
 
-        let mut local_kek = [0u8; 32];
-        crypto::derive_key(master_password, &local_salt, &mut local_kek);
+        if salt_blob.len() != 16 {
+            return Err(anyhow!(
+                "Salt entry has unexpected length ({} bytes, expected 16)",
+                salt_blob.len()
+            ));
+        }
 
-        // 7. Encrypt the master key with the local KEK
-        let encrypted_master_key = crypto::encrypt(&master_key, &local_kek)?;
+        // 4. Derive master key locally — nothing secret crossed the wire.
+        let mut master_key = [0u8; 32];
+        crypto::derive_key(master_password, &salt_blob, &mut master_key);
 
-        // 8. Encrypt the replica keys with the master key
+        // 4b. Verify the password before writing anything locally.
+        //     The source device stored AES-GCM(salt_bytes, master_key) as
+        //     `_meta/auth_tag`.  Decrypting it with the derived master key
+        //     and comparing to the fetched salt proves the password is correct.
+        //     Without this check a wrong password would silently corrupt state.json.
+        let auth_blob = self
+            .iroh
+            .fetch_doc_entry_bytes(
+                namespace_id,
+                b"_meta/auth_tag",
+                std::time::Duration::from_secs(10),
+            )
+            .await?;
+        let decrypted_salt = crypto::decrypt_blob(&auth_blob, &master_key)
+            .map_err(|_| anyhow!("Incorrect master password for the synced vault"))?;
+        if decrypted_salt.as_slice() != salt_blob.as_ref() {
+            master_key.zeroize();
+            return Err(anyhow!("Incorrect master password for the synced vault"));
+        }
+
+        // 5. Encrypt the iroh replica keys with the derived master key.
         let mut ns_bytes = ns_secret.to_bytes();
         let mut author_bytes = author.to_bytes();
 
-        let encrypted_ns = crypto::encrypt(&ns_bytes, &master_key)?;
-        let encrypted_author = crypto::encrypt(&author_bytes, &master_key)?;
+        let encrypted_ns = crypto::encrypt_blob(&ns_bytes, &master_key)?;
+        let encrypted_author = crypto::encrypt_blob(&author_bytes, &master_key)?;
 
-        let mut ns_bytes_vec = ns_bytes.to_vec();
-        let mut author_bytes_vec = author_bytes.to_vec();
-        ns_bytes_vec.zeroize();
-        author_bytes_vec.zeroize();
         ns_bytes.zeroize();
         author_bytes.zeroize();
-        master_key_vec.zeroize();
         master_key.zeroize();
-        src_kek.zeroize();
-        local_kek.zeroize();
 
-        // 9. Save everything in local state.json file
+        // 6. Save state locally (same salt as source device).
         let state = LocalState {
-            salt: hex::encode(local_salt),
-            encrypted_master_key: hex::encode(encrypted_master_key),
+            salt: hex::encode(&salt_blob[..]),
             encrypted_ns_secret: hex::encode(encrypted_ns),
             encrypted_author: hex::encode(encrypted_author),
             namespace_id: namespace_id.to_string(),
@@ -731,7 +848,17 @@ impl VaultManager {
         };
         let state_path = self.base_dir.join("state.json");
         let state_str = serde_json::to_string_pretty(&state)?;
-        std::fs::write(state_path, state_str)?;
+        std::fs::write(&state_path, state_str)?;
+        // Restrict state.json to owner-only read/write (0600).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&state_path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(&state_path, perms);
+            }
+        }
 
         Ok(())
     }
@@ -826,6 +953,58 @@ impl VaultManager {
     ///
     /// Always call this before process exit to avoid partial SQLite WAL frames
     /// or in-flight blob data remaining unmerged.
+    /// Import vault items from a Bitwarden JSON export file.
+    ///
+    /// For encrypted exports, `password` (Bitwarden master password), `email`,
+    /// and `iterations` (PBKDF2 count, default 600 000) are required.
+    /// For unencrypted exports, `password` may be `None`.
+    pub async fn import_bitwarden_json(
+        &mut self,
+        path: &str,
+        password: Option<&str>,
+        email: &str,
+        iterations: u32,
+    ) -> Result<usize> {
+        let items = crate::bitwarden_import::import_from_file(path, password, email, iterations)?;
+        let count = items.len();
+        for item in items {
+            // Serialize → encrypt → store in iroh (reuse add_item logic inline).
+            let (namespace_id, author, dek_v, dek) = {
+                let state = self.get_unlocked()?;
+                let v = state.current_dek_version;
+                let dek = *state
+                    .deks
+                    .get(&v)
+                    .ok_or_else(|| anyhow!("No DEK — vault not properly initialized"))?;
+                (state.namespace_id, state.author.clone(), v, dek)
+            };
+
+            let item_bytes = serde_json::to_vec(&item)?;
+            let (nonce, cipher) = crate::crypto::encrypt(&item_bytes, &dek)?;
+            let blob = rmp_serde::to_vec_named(&ItemEnvelope {
+                dek_v,
+                nonce: nonce.to_vec(),
+                cipher,
+            })?;
+
+            let key = format!("items/{}", item.id);
+            iroh::insert_doc_bytes(
+                self.iroh.docs(),
+                &namespace_id,
+                &author,
+                key.as_bytes(),
+                blob.into(),
+            )
+            .await?;
+
+            if let Some(ref mut state) = self.unlocked {
+                state.items.retain(|e: &VaultItem| e.id != item.id);
+                state.items.push(item);
+            }
+        }
+        Ok(count)
+    }
+
     pub async fn shutdown(&mut self) -> Result<()> {
         // Zero and drop the unlocked state (master key) first
         drop(self.unlocked.take());
@@ -873,9 +1052,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Export ticket
+        // Export ticket — now a plain iroh DocTicket, no custom wrapper
         let ticket = dev1.export_sync_ticket().await.unwrap();
-        assert!(ticket.starts_with("keyroh:"));
+        assert!(!ticket.is_empty(), "ticket should be non-empty");
+        // DocTicket strings are base32-encoded and typically start with "doc"
+        assert!(
+            !ticket.starts_with("keyroh:"),
+            "ticket should no longer use the keyroh: prefix"
+        );
 
         // Import on dev2
         dev2.import_and_init(password, &ticket).await.unwrap();

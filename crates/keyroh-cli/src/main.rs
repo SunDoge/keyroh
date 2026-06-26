@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use keyroh_core::manager::VaultManager;
-use keyroh_core::vault::{CustomField, VaultItem};
+use keyroh_core::vault::{CustomField, UriEntry, VaultItem};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -238,7 +238,7 @@ fn print_item_details(item: &VaultItem) {
         println!("\x1b[1mFolder ID:\x1b[0m      {}", folder_id);
     }
 
-    if let Some(ref login) = item.login {
+    if let Some(ref login) = item.login() {
         println!("\x1b[1;34m-- Login details --\x1b[0m");
         println!(
             "  \x1b[1mUsername:\x1b[0m     {}",
@@ -249,14 +249,12 @@ fn print_item_details(item: &VaultItem) {
             login.password.as_deref().unwrap_or("")
         );
         println!("  \x1b[1mURIs:\x1b[0m         {:?}", login.uris);
-        if let Some(ref totp_secret) = login.totp {
+        if login.totp.is_some() {
             let code = login
                 .get_totp_code()
                 .unwrap_or_else(|| "Invalid TOTP Secret".to_string());
-            println!(
-                "  \x1b[1mTOTP Code:\x1b[0m    {} (Secret: {})",
-                code, totp_secret
-            );
+            // Do NOT print the raw TOTP secret — only the generated code is needed.
+            println!("  \x1b[1mTOTP Code:\x1b[0m    {}", code);
         }
     }
 
@@ -468,7 +466,7 @@ async fn execute_command(command: Commands, vault_dir: &Path) -> Result<()> {
             let item_notes = notes.or_else(|| prompt_string_opt("Notes", None));
             let item_folder_id = folder_id.or_else(|| prompt_string_opt("Folder ID", None));
 
-            let uris = item_uri.map(|u| vec![u]).unwrap_or_default();
+            let uris = item_uri.map(|u| vec![UriEntry::new(u)]).unwrap_or_default();
 
             let mut parsed_fields = Vec::new();
             for f_str in fields {
@@ -508,14 +506,12 @@ async fn execute_command(command: Commands, vault_dir: &Path) -> Result<()> {
                 .into_iter()
                 .map(|item| {
                     let username = item
-                        .login
-                        .as_ref()
+                        .login()
                         .and_then(|l| l.username.clone())
                         .unwrap_or_default();
                     let uri = item
-                        .login
-                        .as_ref()
-                        .and_then(|l| l.uris.first().cloned())
+                        .login()
+                        .and_then(|l| l.uris.first().map(|u| u.uri.clone()))
                         .unwrap_or_default();
                     vec![
                         item.id[..8].to_string() + "...",
@@ -557,14 +553,12 @@ async fn execute_command(command: Commands, vault_dir: &Path) -> Result<()> {
                 .into_iter()
                 .map(|item| {
                     let username = item
-                        .login
-                        .as_ref()
+                        .login()
                         .and_then(|l| l.username.clone())
                         .unwrap_or_default();
                     let uri = item
-                        .login
-                        .as_ref()
-                        .and_then(|l| l.uris.first().cloned())
+                        .login()
+                        .and_then(|l| l.uris.first().map(|u| u.uri.clone()))
                         .unwrap_or_default();
                     vec![
                         item.id[..8].to_string() + "...",
@@ -600,11 +594,11 @@ async fn execute_command(command: Commands, vault_dir: &Path) -> Result<()> {
                 .find(|i| i.id == id || i.id.starts_with(&id))
                 .ok_or_else(|| anyhow!("Vault item not found: {}", id))?;
 
-            let ex_login = existing.login.as_ref();
+            let ex_login = existing.login();
             let ex_username = ex_login.and_then(|l| l.username.clone());
             let ex_password = ex_login.and_then(|l| l.password.clone());
             let ex_totp = ex_login.and_then(|l| l.totp.clone());
-            let ex_uri = ex_login.and_then(|l| l.uris.first().cloned());
+            let ex_uri = ex_login.and_then(|l| l.uris.first().map(|u| u.uri.clone()));
 
             // Interactive prompts/arguments merging
             let new_name = name.unwrap_or_else(|| prompt_string("Item Name", Some(&existing.name)));
@@ -630,7 +624,7 @@ async fn execute_command(command: Commands, vault_dir: &Path) -> Result<()> {
             let new_folder_id =
                 folder_id.or_else(|| prompt_string_opt("Folder ID", existing.folder_id.as_deref()));
 
-            let uris = new_uri.map(|u| vec![u]).unwrap_or_default();
+            let uris = new_uri.map(|u| vec![UriEntry::new(u)]).unwrap_or_default();
 
             let new_fields = if let Some(f_strs) = fields {
                 let mut parsed = Vec::new();
@@ -684,12 +678,15 @@ async fn execute_command(command: Commands, vault_dir: &Path) -> Result<()> {
             let manager = get_unlocked_manager(vault_dir).await?;
             let ticket = manager.export_sync_ticket().await?;
 
-            println!("\n\x1b[1;35mKeyroh Sync Ticket (KEEP THIS SECRET!)\x1b[0m");
+            println!("\n\x1b[1;35mKeyroh Sync Ticket\x1b[0m");
             println!("\x1b[90m==================================================\x1b[0m");
             println!("\x1b[32m{}\x1b[0m", ticket);
             println!("\x1b[90m==================================================\x1b[0m");
             print_info(
-                "Use this ticket with 'keyroh import-keys' on another device to replicate this vault.",
+                "Use this ticket with 'keyroh import-keys --ticket <ticket>' on another device.",
+            );
+            print_info(
+                "The ticket grants write access to the vault document — treat it as sensitive.",
             );
         }
 
@@ -702,30 +699,18 @@ async fn execute_command(command: Commands, vault_dir: &Path) -> Result<()> {
                 ));
             }
 
-            println!("\x1b[1;36mImporting Replica Sync Ticket and Initializing Local Vault\x1b[0m");
+            println!("\x1b[1;36mImporting Sync Ticket — Connecting to Vault\x1b[0m");
+            print_info("Ensure the source device is online; the master key is fetched over P2P.");
             let password = if let Ok(pwd) = std::env::var("KEYROH_PASSWORD") {
                 pwd
             } else {
-                let password =
-                    rpassword::prompt_password("Choose a master password for THIS device: ")?;
-                if password.len() < 8 {
-                    return Err(anyhow!(
-                        "Master password should be at least 8 characters long"
-                    ));
-                }
-
-                let confirm = rpassword::prompt_password("Confirm master password: ")?;
-                if password != confirm {
-                    return Err(anyhow!("Passwords do not match"));
-                }
-                password
+                // Must be the SAME master password used on the source device.
+                rpassword::prompt_password("Enter the vault master password: ")?
             };
 
             manager.import_and_init(&password, &ticket).await?;
-            print_success("Ticket successfully imported and local vault initialized!");
-            print_info(
-                "Subsequent sync reconciliations can now take place. Run 'keyroh list' to view cache.",
-            );
+            print_success("Vault successfully replicated to this device!");
+            print_info("Run 'keyroh unlock' to start a session.");
         }
     }
 

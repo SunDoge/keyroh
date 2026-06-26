@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use keyroh_core::manager::VaultManager;
-use keyroh_core::vault::{CustomField, VaultItem};
+use keyroh_core::vault::{CustomField, UriEntry, VaultItem};
 use keyroh_core::{LiveEvent, SyncInfo};
 
 // ── Clipboard helpers ────────────────────────────────────────────────────────
@@ -46,6 +46,15 @@ enum AppState {
     AddForm,
     EditForm,
     ShowKeys,
+    BitwardenImport, // Import from Bitwarden JSON export
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BwFocus {
+    Path,
+    Email,
+    Password,
+    Iterations,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -141,11 +150,15 @@ impl FormState {
     }
 
     fn from_item(item: &VaultItem) -> Self {
-        let (username, password, url, totp) = if let Some(ref login) = item.login {
+        let (username, password, url, totp) = if let Some(login) = item.login() {
             (
                 login.username.clone().unwrap_or_default(),
                 login.password.clone().unwrap_or_default(),
-                login.uris.first().cloned().unwrap_or_default(),
+                login
+                    .uris
+                    .first()
+                    .map(|u| u.uri.clone())
+                    .unwrap_or_default(),
                 login.totp.clone().unwrap_or_default(),
             )
         } else {
@@ -205,6 +218,13 @@ struct App {
     // Welcome screen cursor
     welcome_choice: WelcomeChoice,
 
+    // Bitwarden JSON import form
+    bw_path: String,
+    bw_email: String,
+    bw_password: String,
+    bw_iterations: String,
+    bw_focus: BwFocus,
+
     // Transient clipboard feedback: (message, shown_at)
     clipboard_msg: Option<(String, Instant)>,
 
@@ -256,6 +276,11 @@ impl App {
             ticket_input: String::new(),
             init_focus: InitFocus::Ticket,
             welcome_choice: WelcomeChoice::Create,
+            bw_path: String::new(),
+            bw_email: String::new(),
+            bw_password: String::new(),
+            bw_iterations: "600000".to_string(),
+            bw_focus: BwFocus::Path,
             clipboard_msg: None,
             // Open the clipboard once and keep it alive for the full app lifetime.
             // On Linux (X11 / Wayland) the clipboard owner must stay alive to
@@ -312,7 +337,7 @@ impl App {
         let uris = if self.form.url.trim().is_empty() {
             vec![]
         } else {
-            vec![self.form.url.clone()]
+            vec![UriEntry::new(self.form.url.clone())]
         };
         let favorite = self.form.favorite.to_lowercase().starts_with('y');
         let folder_id = Some(self.form.folder_id.clone()).filter(|s| !s.trim().is_empty());
@@ -719,7 +744,7 @@ async fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
                             let favorite = !item.favorite;
                             let notes = item.notes.clone();
                             let folder_id = item.folder_id.clone();
-                            let (username, password, totp, uris) = if let Some(ref l) = item.login {
+                            let (username, password, totp, uris) = if let Some(l) = item.login() {
                                 (
                                     l.username.clone(),
                                     l.password.clone(),
@@ -743,6 +768,16 @@ async fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
                         app.form = FormState::new();
                         app.editing_item_id = None;
                         app.state = AppState::AddForm;
+                    }
+                    KeyCode::Char('I') => {
+                        // Capital I: open Bitwarden JSON import screen
+                        app.bw_path.clear();
+                        app.bw_email.clear();
+                        app.bw_password.clear();
+                        app.bw_iterations = "600000".to_string();
+                        app.bw_focus = BwFocus::Path;
+                        app.auth_error = None;
+                        app.state = AppState::BitwardenImport;
                     }
                     KeyCode::Char('e') => {
                         let item_to_edit = app.selected_item().cloned();
@@ -769,7 +804,7 @@ async fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
                     KeyCode::Char('y') => {
                         let pwd = app
                             .selected_item()
-                            .and_then(|item| item.login.as_ref().and_then(|l| l.password.clone()));
+                            .and_then(|item| item.login().and_then(|l| l.password.clone()));
                         if let Some(pw) = pwd {
                             let result = app
                                 .clipboard
@@ -883,6 +918,85 @@ async fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
                 _ => {}
             }
         }
+        AppState::BitwardenImport => {
+            match key.code {
+                KeyCode::Esc => {
+                    app.auth_error = None;
+                    app.state = AppState::Browse;
+                }
+                KeyCode::Tab => {
+                    app.bw_focus = match app.bw_focus {
+                        BwFocus::Path => BwFocus::Email,
+                        BwFocus::Email => BwFocus::Password,
+                        BwFocus::Password => BwFocus::Iterations,
+                        BwFocus::Iterations => BwFocus::Path,
+                    };
+                }
+                KeyCode::BackTab => {
+                    app.bw_focus = match app.bw_focus {
+                        BwFocus::Path => BwFocus::Iterations,
+                        BwFocus::Email => BwFocus::Path,
+                        BwFocus::Password => BwFocus::Email,
+                        BwFocus::Iterations => BwFocus::Password,
+                    };
+                }
+                KeyCode::Char(c) => {
+                    let field = match app.bw_focus {
+                        BwFocus::Path => &mut app.bw_path,
+                        BwFocus::Email => &mut app.bw_email,
+                        BwFocus::Password => &mut app.bw_password,
+                        BwFocus::Iterations => &mut app.bw_iterations,
+                    };
+                    field.push(c);
+                }
+                KeyCode::Backspace => {
+                    let field = match app.bw_focus {
+                        BwFocus::Path => &mut app.bw_path,
+                        BwFocus::Email => &mut app.bw_email,
+                        BwFocus::Password => &mut app.bw_password,
+                        BwFocus::Iterations => &mut app.bw_iterations,
+                    };
+                    field.pop();
+                }
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Ctrl+Enter: run the import
+                    if app.bw_path.trim().is_empty() {
+                        app.auth_error = Some("File path is required".into());
+                    } else {
+                        let path = app.bw_path.trim().to_string();
+                        let email = app.bw_email.trim().to_string();
+                        let password = app.bw_password.clone();
+                        let iterations = app.bw_iterations.trim().parse::<u32>().unwrap_or(600_000);
+
+                        let pw_opt = if password.is_empty() {
+                            None
+                        } else {
+                            Some(password.as_str())
+                        };
+                        match app
+                            .manager
+                            .import_bitwarden_json(&path, pw_opt, &email, iterations)
+                            .await
+                        {
+                            Ok(n) => {
+                                app.auth_error = None;
+                                app.bw_password.clear();
+                                app.update_items_list()?;
+                                app.state = AppState::Browse;
+                                app.clipboard_msg = Some((
+                                    format!("Imported {} items from Bitwarden", n),
+                                    Instant::now(),
+                                ));
+                            }
+                            Err(e) => {
+                                app.auth_error = Some(format!("Import failed: {}", e));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
     Ok(false)
 }
@@ -955,6 +1069,9 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         AppState::AddForm | AppState::EditForm => {
             draw_form_screen(f, chunks[1], app);
         }
+        AppState::BitwardenImport => {
+            draw_bitwarden_import_screen(f, chunks[1], app);
+        }
     }
 
     // Draw Footer (shortcuts)
@@ -968,12 +1085,13 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         }
         AppState::PasswordPrompt => " [Enter] Unlock  |  [Esc] Quit",
         AppState::Browse => {
-            " [/] Search  |  [j/k] Nav  |  [a] Add  |  [e] Edit  |  [d] Del  |  [f] Fav  |  [p] Secret  |  [y] Copy Pwd  |  [r] Refresh  |  [s] Sync  |  [q] Quit"
+            " [/] Search  |  [j/k] Nav  |  [a] Add  |  [e] Edit  |  [d] Del  |  [I] Bitwarden  |  [f] Fav  |  [p] Secret  |  [y] Pwd  |  [r] Refresh  |  [s] Sync  |  [q] Quit"
         }
         AppState::ShowKeys => " [y] Copy Sync Ticket  |  [Esc/s/q] Back  |  (refreshes every 2s)",
         AppState::AddForm | AppState::EditForm => {
             " [Tab/Shift-Tab] Switch Field  |  [Ctrl+Enter] Save  |  [Esc] Cancel"
         }
+        AppState::BitwardenImport => " [Tab] Next Field  |  [Ctrl+Enter] Import  |  [Esc] Cancel",
     };
     let footer = Paragraph::new(Span::styled(
         footer_text,
@@ -1225,11 +1343,11 @@ fn draw_browse_screen(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
             .split(details_area);
 
         // 1. Basic details
-        let (username, password, url) = if let Some(ref l) = item.login {
+        let (username, password, url) = if let Some(l) = item.login() {
             (
                 l.username.as_deref().unwrap_or(""),
                 l.password.as_deref().unwrap_or(""),
-                l.uris.first().map(|u| u.as_str()).unwrap_or(""),
+                l.uris.first().map(|u| u.uri.as_str()).unwrap_or(""),
             )
         } else {
             ("", "", "")
@@ -1287,7 +1405,7 @@ fn draw_browse_screen(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         f.render_widget(Paragraph::new(basic_text), details_layout[0]);
 
         // 2. TOTP Code section
-        if let Some(ref login) = item.login {
+        if let Some(login) = item.login() {
             if login.totp.is_some() {
                 let code = login
                     .get_totp_code()
@@ -1425,7 +1543,16 @@ fn draw_form_screen(f: &mut ratatui::Frame, area: Rect, app: &App) {
             Style::default().fg(Color::DarkGray)
         };
 
-        let p = Paragraph::new(val.as_str()).block(
+        // Mask the password field so it is never shown in plaintext on screen.
+        let masked;
+        let display: &str = if *field_type == FormField::Password {
+            masked = "•".repeat(val.len());
+            &masked
+        } else {
+            val.as_str()
+        };
+
+        let p = Paragraph::new(display).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(field_type.name())
@@ -1665,7 +1792,7 @@ fn draw_init_import_screen(f: &mut ratatui::Frame, area: Rect, app: &App) {
     f.render_widget(block, area);
 
     let intro = Paragraph::new(
-        "Import an existing Sync Ticket to replicate the vault locally.\nYou will need to enter the vault's master password.",
+        "Paste a Sync Ticket from another device. The master key is fetched over P2P.\nEnsure the source device is reachable, then enter the vault master password.",
     );
     f.render_widget(intro, content_chunks[0]);
 
@@ -1706,5 +1833,84 @@ fn draw_init_import_screen(f: &mut ratatui::Frame, area: Rect, app: &App) {
     if let Some(ref err) = app.auth_error {
         let error_para = Paragraph::new(Span::styled(err, Style::default().fg(Color::Red)));
         f.render_widget(error_para, content_chunks[3]);
+    }
+}
+
+fn draw_bitwarden_import_screen(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .title(" Import from Bitwarden ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // intro
+            Constraint::Length(3), // file path
+            Constraint::Length(3), // email
+            Constraint::Length(3), // password
+            Constraint::Length(3), // iterations
+            Constraint::Length(2), // error
+            Constraint::Min(1),
+        ])
+        .split(block.inner(area));
+
+    f.render_widget(block, area);
+
+    let intro = Paragraph::new(
+        "Encrypted export: fill all fields. Unencrypted export: only file path needed.",
+    );
+    f.render_widget(intro, chunks[0]);
+
+    let focused_style = Style::default().fg(Color::Magenta);
+    let unfocused_style = Style::default().fg(Color::DarkGray);
+
+    let fields: &[(&str, &str, BwFocus, bool)] = &[
+        ("File Path", app.bw_path.as_str(), BwFocus::Path, false),
+        (
+            "Bitwarden Email",
+            app.bw_email.as_str(),
+            BwFocus::Email,
+            false,
+        ),
+        (
+            "Master Password",
+            app.bw_password.as_str(),
+            BwFocus::Password,
+            true,
+        ),
+        (
+            "PBKDF2 Iterations",
+            app.bw_iterations.as_str(),
+            BwFocus::Iterations,
+            false,
+        ),
+    ];
+
+    for (i, (label, value, focus, is_pw)) in fields.iter().enumerate() {
+        let is_active = app.bw_focus == *focus;
+        let border_style = if is_active {
+            focused_style
+        } else {
+            unfocused_style
+        };
+        let display = if *is_pw {
+            "*".repeat(value.len())
+        } else {
+            value.to_string()
+        };
+        let p = Paragraph::new(display.as_str()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(*label)
+                .border_style(border_style),
+        );
+        f.render_widget(p, chunks[i + 1]);
+    }
+
+    if let Some(ref err) = app.auth_error {
+        let error_para =
+            Paragraph::new(Span::styled(err.as_str(), Style::default().fg(Color::Red)));
+        f.render_widget(error_para, chunks[5]);
     }
 }
